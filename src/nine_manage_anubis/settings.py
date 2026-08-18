@@ -52,13 +52,13 @@ def load_settings(path: Path | None = None) -> Settings:
 
 def default_config_content(anubis_user: str = "www-anubis") -> str:
     """Generate a starter config file with defaults written out."""
-    policy_path = f"/home/{anubis_user}/.config/anubis/shared-policy.yaml"
     return json.dumps(
         {
-            "_comment": "nine-manage-anubis configuration. All fields optional.",
+            "_comment": "nine-manage-anubis configuration. All fields optional. Uncomment policy_file after running 'install --init-policy'.",
             "anubis_user": anubis_user,
             "anubis_version": "1.27.0",
-            "policy_file": policy_path,
+            "_policy_file_comment": "Set this to share one bot policy across all instances. Run 'install --init-policy' first to extract the default policy.",
+            "policy_file": None,
         },
         indent=4,
     ) + "\n"

@@ -25,6 +25,7 @@ from .commands import (
     cmd_upgrade,
     cmd_status,
     cmd_selftest,
+    CommandResult,
 )
 from .output import format_status, format_steps, format_dry_run
 from .ports import _parse_vhosts_json
@@ -157,15 +158,18 @@ def main(argv: Sequence[str] | None = None, runner=None) -> int:
             return 1
         any_error = False
         for domain in domains:
-            result = cmd_enable(
-                domain,
-                runner=runner,
-                dry_run=dry_run,
-                prepare_only=args.prepare_only,
-                cutover_only=args.cutover_only,
-                anubis_user=anubis_user,
-                policy_file=settings.policy_file,
-            )
+            try:
+                result = cmd_enable(
+                    domain,
+                    runner=runner,
+                    dry_run=dry_run,
+                    prepare_only=args.prepare_only,
+                    cutover_only=args.cutover_only,
+                    anubis_user=anubis_user,
+                    policy_file=settings.policy_file,
+                )
+            except Exception as e:
+                result = CommandResult(error=f"Unexpected error: {e}")
             _print_result(result, dry_run, as_json, title=f"Enable {domain}:")
             if not result.success:
                 any_error = True
@@ -178,12 +182,15 @@ def main(argv: Sequence[str] | None = None, runner=None) -> int:
             return 1
         any_error = False
         for domain in domains:
-            result = cmd_disable(
-                domain,
-                runner=runner,
-                dry_run=dry_run,
-                anubis_user=anubis_user,
-            )
+            try:
+                result = cmd_disable(
+                    domain,
+                    runner=runner,
+                    dry_run=dry_run,
+                    anubis_user=anubis_user,
+                )
+            except Exception as e:
+                result = CommandResult(error=f"Unexpected error: {e}")
             _print_result(result, dry_run, as_json, title=f"Disable {domain}:")
             if not result.success:
                 any_error = True

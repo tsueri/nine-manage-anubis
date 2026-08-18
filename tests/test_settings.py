@@ -49,4 +49,4 @@ def test_default_config_content():
     assert data["anubis_user"] == "www-anubis"
     assert data["anubis_version"] == "1.27.0"
     assert "policy_file" in data
-    assert "shared-policy.yaml" in data["policy_file"]
+    assert data["policy_file"] is None

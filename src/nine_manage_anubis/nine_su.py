@@ -59,7 +59,7 @@ def nine_su_file_exists(user: str, path: str, runner: Runner) -> bool:
 
 def nine_su_glob(user: str, pattern: str, runner: Runner) -> list[str]:
     """Glob files as another user. Returns list of matching paths."""
-    script = f"ls -1 {pattern} 2>/dev/null"
+    script = f"ls -1 {pattern} 2>/dev/null || true"
     result = nine_su(user, script, runner)
     return [line.strip() for line in result.strip().splitlines() if line.strip()]
 
