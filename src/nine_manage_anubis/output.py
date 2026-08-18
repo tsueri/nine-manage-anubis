@@ -34,6 +34,7 @@ def _format_status_table(
 
     rows = []
     for inst in instances:
+        vhosts_str = ", ".join(inst.vhosts) if inst.vhosts else inst.domain
         row = [
             inst.domain,
             str(inst.port),
@@ -41,7 +42,7 @@ def _format_status_table(
             inst.user,
             inst.service_state,
             inst.version or "unknown",
-            str(len(inst.vhosts)),
+            vhosts_str,
         ]
         if health_map is not None:
             row.append(health_map.get(inst.domain, "unknown"))

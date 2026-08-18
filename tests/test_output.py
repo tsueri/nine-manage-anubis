@@ -50,10 +50,18 @@ def test_status_table_with_health():
     assert "HTTP 200" in out
 
 
-def test_status_table_vhost_count():
-    instances = [_instance("example.ch", 7014, vhosts=["example.ch", "blog.example.ch"])]
+def test_status_table_lists_all_vhosts():
+    instances = [_instance("example.ch", 7014, vhosts=["example.ch", "blog.example.ch", "forum.example.ch"])]
     out = format_status(instances)
-    assert "2" in out
+    assert "example.ch" in out
+    assert "blog.example.ch" in out
+    assert "forum.example.ch" in out
+
+
+def test_status_table_vhosts_falls_back_to_domain():
+    instances = [_instance("a.com", 7010, vhosts=[])]
+    out = format_status(instances)
+    assert "a.com" in out
 
 
 # --- format_status JSON -------------------------------------------------------

@@ -537,23 +537,25 @@ The table output has these columns:
 
 | Column | Description |
 |--------|-------------|
-| `DOMAIN` | The instance's primary domain (from the env file name) |
+| `DOMAIN` | The instance's primary domain (from the env file name — the first domain configured for this webroot) |
 | `PORT` | The app port (`BIND`) |
 | `METRICS` | The metrics port (`METRICS_BIND`) |
 | `USER` | The Anubis system user running the instance |
 | `STATE` | systemd service state: `active`, `inactive`, `failed`, `not-found` |
 | `VERSION` | The Anubis binary version string |
-| `VHOSTS` | Number of vhosts proxying to this instance's port |
+| `VHOSTS` | All domains proxying to this instance's port (comma-separated) |
 | `HEALTH` | (only with `--health`) HTTP status code from the health probe, or `inactive` |
 
 Example output:
 
 ```
 DOMAIN              PORT   METRICS   USER         STATE    VERSION                   VHOSTS
-------------------  -----  --------  -----------  -------  ------------------------  ------
-example.com         7010   7011      www-anubis   active   Anubis version 1.27.0     2
-other.com           7012   7013      www-anubis   active   Anubis version 1.27.0     1
+------------------  -----  --------  -----------  -------  ------------------------  --------------------------------
+example.com         7010   7011      www-anubis   active   Anubis version 1.27.0     example.com, www.example.com
+other.com           7012   7013      www-anubis   active   Anubis version 1.27.0     other.com
 ```
+
+> **Note:** The `DOMAIN` column shows the instance name — the first domain that was configured for the webroot. This may not be the most important domain. The `VHOSTS` column lists **all** domains protected by the instance.
 
 #### Examples
 
