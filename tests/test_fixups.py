@@ -137,6 +137,65 @@ def test_apply_wordfence_chain(tmp_path):
     assert "wordfence-waf.php" not in (Path(w) / ".user.ini").read_text()
 
 
+def test_apply_chain_already_in_place_is_noop(tmp_path):
+    """Chain already in place and correct — apply() should be a no-op."""
+    w = _webroot(tmp_path)
+    (Path(w) / ".user.ini").write_text(
+        f"auto_prepend_file = {w}/anubis-prepend-chain.php\n"
+    )
+    chain_content = (
+        "<?php\n"
+        "include_once __DIR__ . '/anubis-origin-shim.php';\n"
+        "include_once __DIR__ . '/wordfence-waf.php';\n"
+    )
+    chain_path = Path(w) / "anubis-prepend-chain.php"
+    chain_path.write_text(chain_content)
+    (Path(w) / "anubis-origin-shim.php").write_text(SHIM_PHP)
+    (Path(w) / ".htaccess").write_text(HTACCESS_BLOCK + "\n# app\n")
+
+    p = apply(w, _ops())
+    assert not p.steps
+    assert chain_path.read_text() == chain_content
+
+
+def test_plan_warns_when_chain_target_missing(tmp_path):
+    """Chain includes a file that no longer exists — plan() should warn."""
+    w = _webroot(tmp_path)
+    (Path(w) / ".user.ini").write_text(
+        f"auto_prepend_file = {w}/anubis-prepend-chain.php\n"
+    )
+    (Path(w) / "anubis-prepend-chain.php").write_text(
+        "<?php\n"
+        "include_once __DIR__ . '/anubis-origin-shim.php';\n"
+        "include_once __DIR__ . '/vanished-waf.php';\n"
+    )
+    (Path(w) / "anubis-origin-shim.php").write_text(SHIM_PHP)
+    (Path(w) / ".htaccess").write_text(HTACCESS_BLOCK + "\n# app\n")
+
+    p = plan(w, _ops())
+    assert any("vanished-waf.php" in warning for warning in p.warnings)
+    assert any("stale" in warning for warning in p.warnings)
+
+
+def test_plan_no_warning_when_chain_target_exists(tmp_path):
+    """Chain includes a file that still exists — plan() should not warn."""
+    w = _webroot(tmp_path)
+    (Path(w) / ".user.ini").write_text(
+        f"auto_prepend_file = {w}/anubis-prepend-chain.php\n"
+    )
+    (Path(w) / "anubis-prepend-chain.php").write_text(
+        "<?php\n"
+        "include_once __DIR__ . '/anubis-origin-shim.php';\n"
+        "include_once __DIR__ . '/wordfence-waf.php';\n"
+    )
+    (Path(w) / "anubis-origin-shim.php").write_text(SHIM_PHP)
+    (Path(w) / "wordfence-waf.php").write_text("<?php // waf\n")
+    (Path(w) / ".htaccess").write_text(HTACCESS_BLOCK + "\n# app\n")
+
+    p = plan(w, _ops())
+    assert not any("stale" in warning for warning in p.warnings)
+
+
 def test_dry_run_does_not_write(tmp_path):
     w = _webroot(tmp_path)
     p = apply(w, _ops(), dry_run=True)
@@ -209,6 +268,7 @@ def test_safety_property_holds():
 
 if __name__ == "__main__":
     import inspect
+    import sys
 
     fns = [v for _, v in inspect.getmembers(sys.modules[__name__], inspect.isfunction)
            if v.__module__ == __name__ and v.__name__.startswith("test_")]

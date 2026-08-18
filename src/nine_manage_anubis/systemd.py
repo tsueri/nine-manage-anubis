@@ -47,14 +47,6 @@ def is_active(user: str, instance: str, runner: Runner = SubprocessRunner()) -> 
     return result.strip()
 
 
-def service_status(user: str, instance: str, runner: Runner = SubprocessRunner()) -> str:
-    return nine_su_systemd(
-        user,
-        f"systemctl --user status anubis@{instance}.service",
-        runner,
-    )
-
-
 def write_systemd_template(user: str, content: str, runner: Runner = SubprocessRunner()) -> str:
     from .config import systemd_template_path
     path = systemd_template_path(user)

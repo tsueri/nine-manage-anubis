@@ -127,10 +127,6 @@ def remove_certificate(domain: str, runner: Runner = SubprocessRunner()) -> str:
     return runner(f"sudo nine-manage-vhosts certificate remove --virtual-host={domain}")
 
 
-def register_certificate_client(runner: Runner = SubprocessRunner()) -> str:
-    return runner("sudo nine-manage-vhosts certificate register-client")
-
-
 # --- User operations ----------------------------------------------------------
 
 
@@ -151,10 +147,3 @@ def create_user(name: str, runner: Runner = SubprocessRunner()) -> str:
 
 def remove_user(name: str, runner: Runner = SubprocessRunner()) -> str:
     return runner(f"sudo nine-manage-vhosts user remove {name}")
-
-
-# --- Webserver ----------------------------------------------------------------
-
-
-def reload_webserver(runner: Runner = SubprocessRunner()) -> str:
-    return runner("sudo nine-manage-vhosts webserver reload")

@@ -221,13 +221,12 @@ def plan(webroot: str, ops: FileOps) -> FixupPlan:
             f"{state.existing_prepend_path}, repoint .user.ini at chain"
         )
     elif state.user_ini is UserIniState.PRESENT_PREPEND_CHAIN:
-        if state.chain_chained_path and state.existing_prepend_path:
-            expected = state.existing_prepend_path.rsplit("/", 1)[-1]
-            actual = state.chain_chained_path.rsplit("/", 1)[-1]
-            if expected != actual:
-                p.steps.append(
-                    f"update anubis-prepend-chain.php: chained path drifted "
-                    f"({actual} -> {expected})"
+        if state.chain_chained_path:
+            chained_path = _webroot_path(webroot, state.chain_chained_path)
+            if not ops.exists(chained_path):
+                p.warnings.append(
+                    f"anubis-prepend-chain.php includes {state.chain_chained_path} "
+                    f"which no longer exists — chain may be stale"
                 )
 
     if state.htaccess is HtaccessState.ABSENT:
@@ -257,7 +256,8 @@ def apply(webroot: str, ops: FileOps, dry_run: bool = False) -> FixupPlan:
     htaccess_path = _webroot_path(webroot, ".htaccess")
     chain_path = _webroot_path(webroot, "anubis-prepend-chain.php")
 
-    if any("anubis-origin-shim.php" in s for s in p.steps):
+    shim_needs_write = not p.state.shim_present or (ops.read(shim_path) or "") != SHIM_PHP
+    if shim_needs_write:
         ops.write(shim_path, SHIM_PHP)
 
     if p.state.user_ini is UserIniState.ABSENT:
@@ -274,10 +274,6 @@ def apply(webroot: str, ops: FileOps, dry_run: bool = False) -> FixupPlan:
         existing_basename = p.state.existing_prepend_path.rsplit("/", 1)[-1]
         ops.write(chain_path, CHAIN_TEMPLATE.format(existing_basename=existing_basename))
         _set_prepend(ops, user_ini_path, chain_path)
-    elif p.state.user_ini is UserIniState.PRESENT_PREPEND_CHAIN:
-        if any("update anubis-prepend-chain.php" in s for s in p.steps):
-            existing_basename = p.state.existing_prepend_path.rsplit("/", 1)[-1]
-            ops.write(chain_path, CHAIN_TEMPLATE.format(existing_basename=existing_basename))
 
     if p.state.htaccess is HtaccessState.ABSENT:
         ops.write(htaccess_path, HTACCESS_BLOCK)
@@ -306,18 +302,17 @@ def _set_prepend(ops: FileOps, user_ini_path: str, target: str) -> None:
 @dataclass
 class RestorePlan:
     webroot: str
+    state: FixupState
     steps: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
 
 
 def restore_plan(webroot: str, ops: FileOps) -> RestorePlan:
     state = detect_state(webroot, ops)
-    rp = RestorePlan(webroot=webroot)
+    rp = RestorePlan(webroot=webroot, state=state)
 
     user_ini_path = _webroot_path(webroot, ".user.ini")
     htaccess_path = _webroot_path(webroot, ".htaccess")
-    shim_path = _webroot_path(webroot, "anubis-origin-shim.php")
-    chain_path = _webroot_path(webroot, "anubis-prepend-chain.php")
 
     if state.user_ini is not UserIniState.ABSENT:
         backups = ops.glob_backups(user_ini_path)
@@ -334,9 +329,9 @@ def restore_plan(webroot: str, ops: FileOps) -> RestorePlan:
         else:
             rp.steps.append("remove the Anubis fixup block from .htaccess (no backup)")
 
-    if ops.exists(shim_path):
+    if state.shim_present:
         rp.steps.append("remove anubis-origin-shim.php")
-    if ops.exists(chain_path):
+    if state.chain_present:
         rp.steps.append("remove anubis-prepend-chain.php")
 
     if not rp.steps:
@@ -351,36 +346,39 @@ def restore(webroot: str, ops: FileOps, dry_run: bool = False) -> RestorePlan:
     if dry_run or not rp.steps:
         return rp
 
+    state = rp.state
     user_ini_path = _webroot_path(webroot, ".user.ini")
     htaccess_path = _webroot_path(webroot, ".htaccess")
     shim_path = _webroot_path(webroot, "anubis-origin-shim.php")
     chain_path = _webroot_path(webroot, "anubis-prepend-chain.php")
 
-    if any("restore .user.ini from" in s for s in rp.steps):
+    if state.user_ini is not UserIniState.ABSENT:
         backups = ops.glob_backups(user_ini_path)
         if backups:
             bak_content = ops.read(backups[0])
             if bak_content is not None:
                 ops.write(user_ini_path, bak_content)
-    elif any("remove .user.ini" in s for s in rp.steps):
-        ops.unlink(user_ini_path)
+        else:
+            ops.unlink(user_ini_path)
 
-    if any("restore .htaccess from" in s for s in rp.steps):
+    if state.htaccess is HtaccessState.PRESENT_WITH_BLOCK:
         backups = ops.glob_backups(htaccess_path)
         if backups:
             bak_content = ops.read(backups[0])
             if bak_content is not None:
                 ops.write(htaccess_path, bak_content)
-    elif any("remove the Anubis fixup block" in s for s in rp.steps):
-        text = ops.read(htaccess_path) or ""
-        text = _strip_htaccess_block(text)
-        if not text.strip():
-            ops.unlink(htaccess_path)
         else:
-            ops.write(htaccess_path, text)
+            text = ops.read(htaccess_path) or ""
+            text = _strip_htaccess_block(text)
+            if not text.strip():
+                ops.unlink(htaccess_path)
+            else:
+                ops.write(htaccess_path, text)
 
-    ops.unlink(shim_path)
-    ops.unlink(chain_path)
+    if state.shim_present:
+        ops.unlink(shim_path)
+    if state.chain_present:
+        ops.unlink(chain_path)
 
     return rp
 

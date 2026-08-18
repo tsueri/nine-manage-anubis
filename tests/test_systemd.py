@@ -7,7 +7,6 @@ from nine_manage_anubis.systemd import (
     disable_service,
     restart_service,
     is_active,
-    service_status,
     write_systemd_template,
     template_exists,
     remove_systemd_template,
