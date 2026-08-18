@@ -182,6 +182,44 @@ def test_resolve_domains_all_disable():
     assert "example.com" not in domains  # not behind Anubis
 
 
+def test_resolve_domains_skip_pattern():
+    """--skip with a glob pattern excludes matching domains."""
+    args = argparse.Namespace(
+        all=True, user="www-example", domains=[], command="enable",
+        skip=["example*"],
+    )
+    r = _runner()
+    domains = _resolve_domains(args, r)
+    assert "example.com" not in domains
+
+
+def test_resolve_domains_skip_multiple_patterns():
+    """--skip can be repeated to exclude multiple patterns."""
+    vhosts = """[
+      {"domain": "a.com", "user": "www-example", "webroot": "/home/www-example/a.com", "template": "default_letsencrypt_https", "template_variables": {}, "aliases": [], "jobs": []},
+      {"domain": "b.com", "user": "www-example", "webroot": "/home/www-example/b.com", "template": "default_letsencrypt_https", "template_variables": {}, "aliases": [], "jobs": []},
+      {"domain": "c.com", "user": "www-example", "webroot": "/home/www-example/c.com", "template": "default_letsencrypt_https", "template_variables": {}, "aliases": [], "jobs": []}
+    ]"""
+    r = _runner(**{"sudo nine-manage-vhosts virtual-host list --json": vhosts})
+    args = argparse.Namespace(
+        all=True, user="www-example", domains=[], command="enable",
+        skip=["a.com", "c*"],
+    )
+    domains = _resolve_domains(args, r)
+    assert domains == ["b.com"]
+
+
+def test_resolve_domains_skip_no_match():
+    """--skip with a non-matching pattern does not exclude anything."""
+    args = argparse.Namespace(
+        all=True, user="www-example", domains=[], command="enable",
+        skip=["nonexistent*"],
+    )
+    r = _runner()
+    domains = _resolve_domains(args, r)
+    assert "example.com" in domains
+
+
 # --- Command dispatch ---------------------------------------------------------
 
 

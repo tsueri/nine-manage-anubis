@@ -13,6 +13,7 @@ CLI flags override config file values.
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import sys
 from typing import Sequence
 
@@ -69,12 +70,16 @@ def build_parser(settings: Settings) -> argparse.ArgumentParser:
     p.add_argument("--cutover-only", action="store_true", help="Only do the cutover step.")
     p.add_argument("--all", action="store_true", help="Enable all vhosts for --user.")
     p.add_argument("--user", help="Website user to filter --all by.")
+    p.add_argument("--skip", action="append", default=[], metavar="PATTERN",
+                   help="Skip domains matching glob pattern (e.g. 'vorlage*', '*.test'). Repeatable.")
 
     # disable
     p = sub.add_parser("disable", help="Remove Anubis protection from a vhost.")
     p.add_argument("domains", nargs="*", help="Domain(s) to disable.")
     p.add_argument("--all", action="store_true", help="Disable all Anubis vhosts for --user.")
     p.add_argument("--user", help="Website user to filter --all by.")
+    p.add_argument("--skip", action="append", default=[], metavar="PATTERN",
+                   help="Skip domains matching glob pattern (e.g. 'vorlage*', '*.test'). Repeatable.")
 
     # upgrade
     p = sub.add_parser("upgrade", help="Download new Anubis binary and restart instances.")
@@ -111,6 +116,10 @@ def _resolve_domains(args: argparse.Namespace, runner) -> list[str]:
 
     vhosts = _parse_vhosts_json(runner)
     user = args.user
+    skip_patterns = getattr(args, "skip", []) or []
+
+    def _is_skipped(domain: str) -> bool:
+        return any(fnmatch.fnmatch(domain, pat) for pat in skip_patterns)
 
     if args.command == "enable":
         return [
@@ -118,6 +127,7 @@ def _resolve_domains(args: argparse.Namespace, runner) -> list[str]:
             if vh.get("user") == user
             and vh.get("template") != "proxy_letsencrypt_https_redirect"
             and not vh["domain"].startswith("origin-")
+            and not _is_skipped(vh["domain"])
         ]
     elif args.command == "disable":
         return [
@@ -125,6 +135,7 @@ def _resolve_domains(args: argparse.Namespace, runner) -> list[str]:
             if vh.get("user") == user
             and vh.get("template") == "proxy_letsencrypt_https_redirect"
             and not vh["domain"].startswith("origin-")
+            and not _is_skipped(vh["domain"])
         ]
     return []
 
