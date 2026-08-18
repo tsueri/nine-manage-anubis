@@ -402,8 +402,8 @@ The recipe above assumes a greenfield vhost. In practice you're more likely to s
     # Googlebot passes?
     curl -A Googlebot https://<domain>/ | grep -o '<title>[^<]*</title>'
 
-    # Origin shim working? (HTTP_HOST should be the public domain, not origin-<domain>)
-    curl -sA Googlebot https://<domain>/ | grep -i 'HTTP_HOST\|host' | head -5
+    # Origin shim working? (should show the site title, not a redirect to wp-signup.php?new=origin-*)
+    curl -sA Googlebot https://<domain>/ | grep -ioE '<title>[^<]*</title>'
 
     # Trailing-slash redirect uses public domain? (should show https://<domain>/, not https://origin-<domain>/)
     curl -sI -A Googlebot https://<domain>/somedir | grep -i location
@@ -420,7 +420,7 @@ The recipe above assumes a greenfield vhost. In practice you're more likely to s
     # Browser: open https://<domain>/ — challenge solves, site loads.
     ```
 
-    If the `HTTP_HOST` check shows `origin-<domain>`, the shim isn't loaded — check `.user.ini` path and permissions. If the trailing-slash redirect points at `origin-<domain>`, the `.htaccess` fixup block is missing or below app rules.
+    If the title shows a redirect to `wp-signup.php?new=origin-<domain>` or URLs in the HTML point to `origin-<domain>`, the shim isn't loaded — check `.user.ini` path and permissions. If the trailing-slash redirect points at `origin-<domain>`, the `.htaccess` fixup block is missing or below app rules.
 
 ### Rollback
 

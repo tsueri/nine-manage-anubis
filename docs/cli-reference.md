@@ -291,7 +291,11 @@ PHP-FPM caches `.user.ini` for 300 seconds (`user_ini.cache_ttl`). If you prepar
 The `--prepare-only` / `--cutover-only` flags split the flow so you can wait for the cache to expire between prepare and cutover:
 
 - `--prepare-only`: steps 1–8 (no traffic impact)
-- Wait 5 minutes for PHP-FPM to pick up the `.user.ini` shim
+- Wait 5 minutes for PHP-FPM to pick up the `.user.ini` shim. Verify the shim is loaded:
+  ```sh
+  curl -sA Googlebot https://<domain>/ | grep -ioE '<title>[^<]*</title>'
+  ```
+  Should show the site title, not a redirect to `wp-signup.php?new=origin-*`.
 - `--cutover-only`: steps 9–10 (brief Apache reload)
 
 #### Multisite reuse
@@ -895,6 +899,8 @@ nine-manage-anubis --dry-run enable --all --user www-example
 nine-manage-anubis enable --all --user www-example --prepare-only
 
 # 3. Wait 5 minutes for PHP-FPM .user.ini cache to expire
+#    Verify the shim is loaded:
+#    curl -sA Googlebot https://<domain>/ | grep -ioE '<title>[^<]*</title>'
 
 # 4. Cut over
 nine-manage-anubis enable --all --user www-example --cutover-only

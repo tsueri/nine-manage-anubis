@@ -388,7 +388,8 @@ nine-manage-anubis enable --all --user www-example --prepare-only
 
 # Step 2: Wait 5 minutes for PHP-FPM to pick up the .user.ini shim.
 # You can verify the shim is loaded during this window:
-#   curl -sA Googlebot https://example.com/ | grep -i 'HTTP_HOST'
+#   curl -sA Googlebot https://example.com/ | grep -ioE '<title>[^<]*</title>'
+# (should show the site title, not a redirect to wp-signup.php?new=origin-*)
 
 # Step 3: Cut over all domains (brief Apache reload per domain)
 nine-manage-anubis enable --all --user www-example --cutover-only
