@@ -8,6 +8,7 @@ from nine_manage_anubis.commands import (
     cmd_disable,
     cmd_upgrade,
     cmd_status,
+    cmd_selftest,
     DEFAULT_ANUBIS_USER,
 )
 
@@ -296,3 +297,121 @@ def test_status_with_health():
     instances, health_map = cmd_status(health=True, runner=r)
     assert health_map is not None
     assert "test.example.ch" in health_map
+
+
+# --- self-test ----------------------------------------------------------------
+
+
+def test_selftest_all_pass():
+    r = _base_runner()
+    result = cmd_selftest(runner=r)
+    assert result.success
+    steps_text = " ".join(result.steps)
+    assert "user" in steps_text.lower()
+    assert "binary" in steps_text.lower()
+    assert "template" in steps_text.lower()
+    assert "test.example.ch" in steps_text
+
+
+def test_selftest_no_instances():
+    r = _base_runner(**{
+        "sudo nine-manage-vhosts virtual-host list --json": VHOSTS_EMPTY,
+        "ss -tlnp": "",
+        "ls -d /home/www-*/ 2>/dev/null": "",
+    })
+    result = cmd_selftest(runner=r)
+    assert result.success
+    assert any("no instances" in s.lower() for s in result.steps)
+
+
+def test_selftest_instance_not_active():
+    r = _base_runner(**{
+        _SU + "export XDG_RUNTIME_DIR": "failed",
+        _SU + "/home/www-anubis/bin/anubis --version": "Anubis version 1.27.0\n",
+    })
+    result = cmd_selftest(runner=r)
+    assert not result.success
+    assert any("not active" in s.lower() or "failed" in s.lower() for s in result.warnings)
+
+
+def test_selftest_http_probe_fails():
+    r = _base_runner(**{
+        "curl -s -o /dev/null -w '%{http_code}'": "502",
+    })
+    result = cmd_selftest(runner=r)
+    assert not result.success
+    assert any("502" in s for s in result.warnings)
+
+
+def test_selftest_dry_run():
+    r = _base_runner()
+    result = cmd_selftest(runner=r, dry_run=True)
+    assert result.success
+    steps_text = " ".join(result.steps)
+    assert "Would" in steps_text
+
+
+# --- enable rollback ----------------------------------------------------------
+
+
+def test_enable_rollback_on_service_enable_failure():
+    """If enable_service raises, rollback undoes fixups + origin vhost + env/key."""
+    call_count = {"enable": 0}
+
+    def failing_runner(cmd: str) -> str:
+        r = _base_runner()
+        if "systemctl --user enable" in cmd:
+            call_count["enable"] += 1
+            raise RuntimeError("systemctl enable failed")
+        return r(cmd)
+
+    result = cmd_enable("example.com", runner=failing_runner)
+    assert not result.success
+    assert "rollback" in result.error.lower() or "rolled back" in result.error.lower()
+    assert any("rollback" in s.lower() or "rolled back" in s.lower() for s in result.steps)
+    assert call_count["enable"] == 1
+
+
+def test_enable_rollback_on_cutover_failure():
+    """If switch_to_proxy raises, rollback undoes service + fixups + origin vhost + env/key."""
+    def failing_runner(cmd: str) -> str:
+        r = _base_runner()
+        if "virtual-host update example.com" in cmd and "--template=proxy_letsencrypt_https_redirect" in cmd:
+            raise RuntimeError("cutover failed")
+        return r(cmd)
+
+    result = cmd_enable("example.com", runner=failing_runner)
+    assert not result.success
+    assert "rollback" in result.error.lower() or "rolled back" in result.error.lower()
+
+
+def test_enable_no_rollback_on_validation_error():
+    """If vhost not found, no rollback needed — nothing was done."""
+    r = _base_runner()
+    result = cmd_enable("nonexistent.com", runner=r)
+    assert not result.success
+    assert "not found" in result.error
+    assert not any("rollback" in s.lower() for s in result.steps)
+
+
+def test_enable_reused_webroot_rollback_on_cutover_failure():
+    """Reused webroot path: only cutover needs rollback (switch back to default)."""
+    vhosts = """[
+      {"domain": "example.ch", "user": "www-example", "webroot": "/home/www-example/example.ch", "template": "proxy_letsencrypt_https_redirect", "template_variables": {"PROXYPORT": "7014"}, "aliases": [], "jobs": []},
+      {"domain": "blog.example.ch", "user": "www-example", "webroot": "/home/www-example/example.ch", "template": "default_letsencrypt_https", "template_variables": {"PHP_VERSION": "8.2"}, "aliases": [], "jobs": []}
+    ]"""
+    r = _base_runner(**{
+        "sudo nine-manage-vhosts virtual-host list --json": vhosts,
+        "ss -tlnp": "LISTEN 0 4096 0.0.0.0:7014 0.0.0.0:* users:((\"anubis\",pid=1,fd=3))\n",
+        _SU + "ls ~/.config/anubis/*.env 2>/dev/null": "/home/www-anubis/.config/anubis/example.ch.env\n",
+        _SU + "cat '/home/www-anubis/.config/anubis/example.ch.env'": "BIND=:7014\nMETRICS_BIND=:7015\nTARGET_HOST=origin-example.ch\n",
+    })
+
+    def failing_runner(cmd: str) -> str:
+        if "virtual-host update blog.example.ch" in cmd and "--template=proxy_letsencrypt_https_redirect" in cmd:
+            raise RuntimeError("cutover failed")
+        return r(cmd)
+
+    result = cmd_enable("blog.example.ch", runner=failing_runner)
+    assert not result.success
+    assert "rollback" in result.error.lower() or "rolled back" in result.error.lower()

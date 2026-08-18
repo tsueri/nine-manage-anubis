@@ -72,8 +72,9 @@ def _run(argv, runner=None):
 
 def test_parser_has_all_commands():
     parser = build_parser()
-    args = parser.parse_args(["status"])
-    assert args.command == "status"
+    for cmd in ("install", "uninstall", "enable", "disable", "upgrade", "status", "self-test"):
+        args = parser.parse_args([cmd] if cmd != "enable" else [cmd, "x.com"])
+        assert args.command == cmd
 
 
 def test_parser_enable_with_domains():
@@ -248,3 +249,29 @@ def test_upgrade_dry_run():
     rc, out, err = _run(["--dry-run", "upgrade"], runner=r)
     assert rc == 0
     assert "1.27.0" in out
+
+
+def test_self_test():
+    r = _runner()
+    rc, out, err = _run(["self-test"], runner=r)
+    assert rc == 0
+    assert "test.example.ch" in out
+
+
+def test_self_test_dry_run():
+    r = _runner()
+    rc, out, err = _run(["--dry-run", "self-test"], runner=r)
+    assert rc == 0
+    assert "Would" in out
+
+
+def test_self_test_failure_shows_detail():
+    """On failure, steps and warnings must still be printed alongside the error."""
+    r = _runner(**{
+        _SU + "export XDG_RUNTIME_DIR": "failed",
+    })
+    rc, out, err = _run(["self-test"], runner=r)
+    assert rc == 0
+    assert "User www-anubis exists" in out
+    assert "not active" in err.lower() or "failed" in err.lower()
+    assert "check(s) failed" in err

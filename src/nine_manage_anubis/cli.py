@@ -21,6 +21,7 @@ from .commands import (
     cmd_disable,
     cmd_upgrade,
     cmd_status,
+    cmd_selftest,
     DEFAULT_ANUBIS_USER,
 )
 from .output import format_status, format_steps, format_dry_run
@@ -77,6 +78,9 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("status", help="List Anubis instances.")
     p.add_argument("--domain", help="Filter by domain.")
     p.add_argument("--health", action="store_true", help="Active health check (curl).")
+
+    # self-test
+    sub.add_parser("self-test", help="Verify Anubis infrastructure health.")
 
     return parser
 
@@ -190,18 +194,34 @@ def main(argv: Sequence[str] | None = None, runner=None) -> int:
         )
         print(format_status(instances, health_map=health_map, as_json=as_json))
 
+    elif args.command == "self-test":
+        result = cmd_selftest(
+            runner=runner,
+            dry_run=dry_run,
+            anubis_user=anubis_user,
+        )
+        _print_result(result, dry_run, as_json, title="Self-test:")
+
     return 0
 
 
 def _print_result(result, dry_run: bool, as_json: bool, title: str = ""):
-    if result.error:
-        print(f"Error: {result.error}", file=sys.stderr)
+    if as_json:
+        import json
+        data: dict = {"steps": result.steps}
+        if result.warnings:
+            data["warnings"] = result.warnings
+        if result.error:
+            data["error"] = result.error
+        print(json.dumps(data, indent=2))
         return
 
     if dry_run:
-        print(format_dry_run(result.steps, title=title, as_json=as_json))
+        print(format_dry_run(result.steps, title=title))
     else:
-        print(format_steps(result.steps, title=title, as_json=as_json))
+        print(format_steps(result.steps, title=title))
 
     for w in result.warnings:
         print(f"  WARNING: {w}", file=sys.stderr)
+    if result.error:
+        print(f"Error: {result.error}", file=sys.stderr)

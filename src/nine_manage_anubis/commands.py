@@ -151,6 +151,24 @@ def cmd_uninstall(
 # --- enable -------------------------------------------------------------------
 
 
+def _rollback(undo_stack: list, result: CommandResult) -> None:
+    """Execute undo actions in reverse order. Best-effort."""
+    undone = 0
+    for undo in reversed(undo_stack):
+        try:
+            undo()
+            undone += 1
+        except Exception:
+            result.warnings.append("A rollback step failed — manual cleanup may be needed")
+    result.steps.append(f"Rolled back {undone} of {len(undo_stack)} step(s)")
+
+
+def _fail_with_rollback(undo_stack: list, result: CommandResult, exc: Exception) -> None:
+    """Roll back and set error message."""
+    _rollback(undo_stack, result)
+    result.error = f"Enable failed: {exc}. Rolled back {len(undo_stack)} step(s)."
+
+
 def cmd_enable(
     domain: str,
     runner: Runner = SubprocessRunner(),
@@ -194,8 +212,14 @@ def cmd_enable(
             )
 
         if not prepare_only:
-            switch_to_proxy(domain, alloc.app_port, runner=runner)
-            result.steps.append(f"Switched {domain} to proxy template (PROXYPORT={alloc.app_port})")
+            undo_stack: list = []
+            try:
+                switch_to_proxy(domain, alloc.app_port, runner=runner)
+                undo_stack.append(lambda: switch_to_default(domain, runner=runner))
+                result.steps.append(f"Switched {domain} to proxy template (PROXYPORT={alloc.app_port})")
+            except Exception as e:
+                _fail_with_rollback(undo_stack, result, e)
+                return result
         return result
 
     config = AnubisConfig(
@@ -205,6 +229,9 @@ def cmd_enable(
         anubis_user=anubis_user,
         key_path=key_path_for(anubis_user, domain),
     )
+
+    undo_stack: list = []
+    ops = RemoteFileOps(website_user, runner)
 
     if not cutover_only:
         key_content = generate_key(runner=runner)
@@ -223,7 +250,6 @@ def cmd_enable(
         else:
             result.steps.append("Systemd template already installed")
 
-        ops = RemoteFileOps(website_user, runner)
         fixup_plan = apply_fixups(webroot, ops, dry_run=True)
         result.steps.extend(f"Fixup: {s}" for s in fixup_plan.steps)
 
@@ -232,29 +258,44 @@ def cmd_enable(
         result.steps.append(f"Start anubis@{domain}.service")
 
         if not dry_run:
-            write_key_file(anubis_user, config.key_path, key_content, runner=runner)
-            write_env_file(anubis_user, config.env_path, env_content, runner=runner)
+            try:
+                write_key_file(anubis_user, config.key_path, key_content, runner=runner)
+                undo_stack.append(lambda: remove_file(anubis_user, config.key_path, runner=runner))
 
-            if not template_exists(anubis_user, runner=runner):
-                write_systemd_template(anubis_user, SYSTEMD_TEMPLATE, runner=runner)
+                write_env_file(anubis_user, config.env_path, env_content, runner=runner)
+                undo_stack.append(lambda: remove_file(anubis_user, config.env_path, runner=runner))
 
-            daemon_reload(anubis_user, runner=runner)
+                if not template_exists(anubis_user, runner=runner):
+                    write_systemd_template(anubis_user, SYSTEMD_TEMPLATE, runner=runner)
 
-            apply_fixups(webroot, ops, dry_run=False)
+                daemon_reload(anubis_user, runner=runner)
 
-            create_origin_vhost(domain, website_user, webroot, php_version, runner=runner)
+                apply_fixups(webroot, ops, dry_run=False)
+                undo_stack.append(lambda: restore_fixups(webroot, ops, dry_run=False))
 
-            enable_service(anubis_user, domain, runner=runner)
+                create_origin_vhost(domain, website_user, webroot, php_version, runner=runner)
+                undo_stack.append(lambda: remove_origin_vhost(domain, runner=runner))
+
+                enable_service(anubis_user, domain, runner=runner)
+                undo_stack.append(lambda: disable_service(anubis_user, domain, runner=runner))
+            except Exception as e:
+                _fail_with_rollback(undo_stack, result, e)
+                return result
 
     if not prepare_only:
         if dry_run:
             result.steps.append(f"Would cut over {domain} to proxy template (PROXYPORT={alloc.app_port})")
         else:
-            if not certificate_exists(domain, runner=runner):
-                create_certificate(domain, runner=runner)
-                result.steps.append(f"Created Let's Encrypt certificate for {domain}")
-            switch_to_proxy(domain, alloc.app_port, runner=runner)
-            result.steps.append(f"Cut over {domain} to proxy template (PROXYPORT={alloc.app_port})")
+            try:
+                if not certificate_exists(domain, runner=runner):
+                    create_certificate(domain, runner=runner)
+                    result.steps.append(f"Created Let's Encrypt certificate for {domain}")
+                switch_to_proxy(domain, alloc.app_port, runner=runner)
+                undo_stack.append(lambda: switch_to_default(domain, runner=runner))
+                result.steps.append(f"Cut over {domain} to proxy template (PROXYPORT={alloc.app_port})")
+            except Exception as e:
+                _fail_with_rollback(undo_stack, result, e)
+                return result
 
     return result
 
@@ -434,3 +475,76 @@ def cmd_status(
                 health_map[inst.domain] = "inactive"
 
     return instances, health_map
+
+
+# --- self-test ----------------------------------------------------------------
+
+
+def _check(result: CommandResult, ok: bool, pass_msg: str, fail_msg: str) -> None:
+    if ok:
+        result.steps.append(pass_msg)
+    else:
+        result.warnings.append(fail_msg)
+
+
+def cmd_selftest(
+    runner: Runner = SubprocessRunner(),
+    dry_run: bool = False,
+    anubis_user: str = DEFAULT_ANUBIS_USER,
+) -> CommandResult:
+    result = CommandResult()
+
+    if dry_run:
+        result.steps.append(f"Would check user {anubis_user} exists")
+        result.steps.append("Would check binary runs")
+        result.steps.append("Would check systemd template exists")
+        result.steps.append("Would check each instance is active + HTTP-responding")
+        return result
+
+    _check(result, user_exists(anubis_user, runner=runner),
+           f"User {anubis_user} exists", f"User {anubis_user} does not exist")
+
+    _check(result, binary_exists(anubis_user, runner=runner),
+           f"Binary: {binary_version(anubis_user, runner=runner).strip()}",
+           f"Binary not found for {anubis_user}")
+
+    _check(result, template_exists(anubis_user, runner=runner),
+           "Systemd template installed", "Systemd template not installed")
+
+    instances = discover_instances(runner=runner)
+    if not instances:
+        result.steps.append("No instances to check")
+        if result.warnings:
+            result.error = f"{len(result.warnings)} check(s) failed"
+        return result
+
+    for inst in instances:
+        if not inst.is_running:
+            result.warnings.append(
+                f"anubis@{inst.domain}.service is not active (state: {inst.service_state})")
+            continue
+        result.steps.append(f"anubis@{inst.domain}.service: active")
+        try:
+            response = runner(
+                f"curl -s -o /dev/null -w '%{{http_code}}' "
+                f"-H 'X-Real-Ip: 127.0.0.1' -H 'Host: {inst.domain}' "
+                f"http://localhost:{inst.port}/"
+            )
+            code_str = response.strip().strip("'")
+            try:
+                code = int(code_str)
+                ok = 200 <= code < 400
+            except ValueError:
+                code = code_str
+                ok = False
+            if ok:
+                result.steps.append(f"  HTTP probe: {code}")
+            else:
+                result.warnings.append(
+                    f"anubis@{inst.domain}.service HTTP probe returned {code}")
+        except Exception:
+            result.warnings.append(f"anubis@{inst.domain}.service HTTP probe failed")
+
+    if result.warnings:
+        result.error = f"{len(result.warnings)} check(s) failed"
+    return result
