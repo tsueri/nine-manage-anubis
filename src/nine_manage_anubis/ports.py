@@ -263,6 +263,33 @@ def find_port_for_domain(
     return None
 
 
+def find_prepared_port_for_webroot(
+    webroot: str, exclude_domain: str | None = None, runner: Runner = SubprocessRunner()
+) -> int | None:
+    """Find a port from an env file for any domain sharing this webroot.
+
+    During --prepare-only, no vhost is behind Anubis yet, so
+    find_instance_for_webroot returns None.  But a sibling domain
+    processed earlier in the same batch may already have an env file.
+    Reuse that port instead of allocating a new one (which would
+    become an orphan once the cutover detects the webroot match).
+    """
+    vhosts = _parse_vhosts_json(runner)
+    domains_with_webroot = {
+        vh["domain"] for vh in vhosts
+        if vh.get("webroot") == webroot
+        and not vh["domain"].startswith("origin-")
+        and vh["domain"] != exclude_domain
+    }
+    if not domains_with_webroot:
+        return None
+    claimed = get_claimed_ports(runner)
+    for port, (user, dom) in claimed.items():
+        if dom in domains_with_webroot:
+            return port
+    return None
+
+
 def allocate_for_domain(
     domain: str, runner: Runner = SubprocessRunner()
 ) -> PortAllocation:
@@ -272,6 +299,7 @@ def allocate_for_domain(
 
     webroot = vh.get("webroot", "")
     if webroot:
+        # 1. A proxy vhost sharing this webroot is already behind Anubis.
         existing = find_instance_for_webroot(webroot, runner)
         if existing is not None:
             claimed = get_claimed_ports(runner)
@@ -286,7 +314,20 @@ def allocate_for_domain(
                 reused_from=primary,
             )
 
-    # An env file from --prepare-only already has the port we need.
+        # 2. A sibling domain sharing this webroot was already prepared
+        #    (env file exists) but not yet cut over.  Reuse its port so
+        #    we don't create an orphan instance.
+        prepared_port = find_prepared_port_for_webroot(webroot, exclude_domain=domain, runner=runner)
+        if prepared_port is not None:
+            claimed = get_claimed_ports(runner)
+            primary = claimed.get(prepared_port, ("", "unknown"))[1]
+            return PortAllocation(
+                app_port=prepared_port,
+                metrics_port=prepared_port + 1,
+                reused_from=primary,
+            )
+
+    # 3. This domain's own env file from --prepare-only.
     existing_port = find_port_for_domain(domain, runner)
     if existing_port is not None:
         return PortAllocation(
@@ -294,5 +335,6 @@ def allocate_for_domain(
             metrics_port=existing_port + 1,
         )
 
+    # 4. Nothing exists yet — allocate a fresh pair.
     app, metrics = next_free_pair(runner)
     return PortAllocation(app_port=app, metrics_port=metrics)

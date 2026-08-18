@@ -28,6 +28,7 @@ from nine_manage_anubis.ports import (
     next_free_pair,
     allocate_for_domain,
     find_port_for_domain,
+    find_prepared_port_for_webroot,
 )
 
 # --- Sample data --------------------------------------------------------------
@@ -338,3 +339,110 @@ def test_allocate_for_domain_with_existing_env_file():
     assert not alloc.is_reused
     assert alloc.app_port == 7020
     assert alloc.metrics_port == 7021
+
+
+def test_find_prepared_port_for_webroot():
+    """find_prepared_port_for_webroot finds env file of a sibling domain."""
+    # example.com shares webroot with example2.com (both /home/www-example/example.com)
+    vhosts = VHOSTS_JSON.replace(
+        '"example.com"',
+        '"example.com","webroot": "/home/www-example/example.com","template": "default_letsencrypt_https","template_variables": {"TIMEOUT": "300","PHP_VERSION": "8.2","MODSEC": "Off"}, "aliases": [], "jobs": []},'
+        '\n  {"domain": "example2.com", "user": "www-example"'
+    )
+    # Actually, let's build clean vhost data
+    vhosts = """[
+  {"domain": "site-a.ch", "user": "www-example", "webroot": "/home/www-example/shared", "template": "default_letsencrypt_https", "template_variables": {}, "aliases": [], "jobs": []},
+  {"domain": "site-b.ch", "user": "www-example", "webroot": "/home/www-example/shared", "template": "default_letsencrypt_https", "template_variables": {}, "aliases": [], "jobs": []},
+  {"domain": "other.com", "user": "www-example", "webroot": "/home/www-example/other", "template": "default_letsencrypt_https", "template_variables": {}, "aliases": [], "jobs": []}
+]"""
+    env_a = "BIND=:7020\nMETRICS_BIND=:7021\nTARGET_HOST=origin-site-a.ch\n"
+    r = FakeRunner({
+        "sudo nine-manage-vhosts virtual-host list --json": vhosts,
+        "ss -tlnp": "",
+        "ls -d /home/www-*/ 2>/dev/null": "/home/www-anubis/\n/home/www-example/\n",
+        "test -d /home/www-anubis/.config/anubis && echo yes || echo no": "yes",
+        "test -d /home/www-example/.config/anubis && echo yes || echo no": "no",
+        _su_key("ls ~/.config/anubis/*.env 2>/dev/null"): (
+            "/home/www-anubis/.config/anubis/site-a.ch.env\n"
+        ),
+        _su_key("cat '/home/www-anubis/.config/anubis/site-a.ch.env'"): env_a,
+    })
+    port = find_prepared_port_for_webroot("/home/www-example/shared", runner=r)
+    assert port == 7020
+
+
+def test_find_prepared_port_for_webroot_no_match():
+    """Returns None when no sibling has an env file."""
+    vhosts = """[
+  {"domain": "site-a.ch", "user": "www-example", "webroot": "/home/www-example/shared", "template": "default_letsencrypt_https", "template_variables": {}, "aliases": [], "jobs": []}
+]"""
+    r = FakeRunner({
+        "sudo nine-manage-vhosts virtual-host list --json": vhosts,
+        "ls -d /home/www-*/ 2>/dev/null": "/home/www-anubis/\n",
+        "test -d /home/www-anubis/.config/anubis && echo yes || echo no": "yes",
+        _su_key("ls ~/.config/anubis/*.env 2>/dev/null"): "",
+    })
+    port = find_prepared_port_for_webroot("/home/www-example/shared", runner=r)
+    assert port is None
+
+
+def test_allocate_for_domain_reuses_prepared_sibling():
+    """During --prepare-only, a domain sharing a webroot with an already-prepared
+    sibling must reuse the sibling's port instead of allocating a new pair.
+
+    Without this, each domain in a shared-webroot group gets its own instance
+    during prepare, and the cutover later reassigns them all to the first
+    domain's instance — leaving the others as orphans.
+    """
+    vhosts = """[
+  {"domain": "site-a.ch", "user": "www-example", "webroot": "/home/www-example/shared", "template": "proxy_letsencrypt_https_redirect", "template_variables": {"PROXYPORT": "7020"}, "aliases": [], "jobs": []},
+  {"domain": "site-b.ch", "user": "www-example", "webroot": "/home/www-example/shared", "template": "default_letsencrypt_https", "template_variables": {}, "aliases": [], "jobs": []}
+]"""
+    env_a = "BIND=:7020\nMETRICS_BIND=:7021\nTARGET_HOST=origin-site-a.ch\n"
+    r = FakeRunner({
+        "sudo nine-manage-vhosts virtual-host list --json": vhosts,
+        "ss -tlnp": "LISTEN 0 4096 0.0.0.0:7020 0.0.0.0:* users:((\"anubis\",pid=1,fd=3))\n",
+        "ls -d /home/www-*/ 2>/dev/null": "/home/www-anubis/\n/home/www-example/\n",
+        "test -d /home/www-anubis/.config/anubis && echo yes || echo no": "yes",
+        "test -d /home/www-example/.config/anubis && echo yes || echo no": "no",
+        _su_key("ls ~/.config/anubis/*.env 2>/dev/null"): (
+            "/home/www-anubis/.config/anubis/site-a.ch.env\n"
+        ),
+        _su_key("cat '/home/www-anubis/.config/anubis/site-a.ch.env'"): env_a,
+    })
+    # site-b.ch shares webroot with site-a.ch which is already behind Anubis
+    alloc = allocate_for_domain("site-b.ch", r)
+    assert alloc.is_reused
+    assert alloc.app_port == 7020
+    assert alloc.reused_from == "site-a.ch"
+
+
+def test_allocate_for_domain_reuses_prepared_sibling_not_yet_cut_over():
+    """During --prepare-only (no proxy vhost yet), a domain sharing a webroot
+    with an already-prepared sibling must reuse the sibling's env-file port.
+
+    This is the key orphan-prevention test: neither domain is behind Anubis
+    yet, but site-a.ch has an env file from being prepared first in the batch.
+    site-b.ch must reuse that port, not allocate a new one.
+    """
+    vhosts = """[
+  {"domain": "site-a.ch", "user": "www-example", "webroot": "/home/www-example/shared", "template": "default_letsencrypt_https", "template_variables": {}, "aliases": [], "jobs": []},
+  {"domain": "site-b.ch", "user": "www-example", "webroot": "/home/www-example/shared", "template": "default_letsencrypt_https", "template_variables": {}, "aliases": [], "jobs": []}
+]"""
+    env_a = "BIND=:7020\nMETRICS_BIND=:7021\nTARGET_HOST=origin-site-a.ch\n"
+    r = FakeRunner({
+        "sudo nine-manage-vhosts virtual-host list --json": vhosts,
+        "ss -tlnp": "LISTEN 0 4096 0.0.0.0:7020 0.0.0.0:* users:((\"anubis\",pid=1,fd=3))\n",
+        "ls -d /home/www-*/ 2>/dev/null": "/home/www-anubis/\n/home/www-example/\n",
+        "test -d /home/www-anubis/.config/anubis && echo yes || echo no": "yes",
+        "test -d /home/www-example/.config/anubis && echo yes || echo no": "no",
+        _su_key("ls ~/.config/anubis/*.env 2>/dev/null"): (
+            "/home/www-anubis/.config/anubis/site-a.ch.env\n"
+        ),
+        _su_key("cat '/home/www-anubis/.config/anubis/site-a.ch.env'"): env_a,
+    })
+    # Neither is behind Anubis, but site-a.ch has an env file
+    alloc = allocate_for_domain("site-b.ch", r)
+    assert alloc.is_reused
+    assert alloc.app_port == 7020
+    assert alloc.reused_from == "site-a.ch"
