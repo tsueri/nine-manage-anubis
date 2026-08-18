@@ -7,6 +7,7 @@ from nine_manage_anubis.commands import (
     cmd_enable,
     cmd_disable,
     cmd_upgrade,
+    cmd_restart,
     cmd_status,
     cmd_selftest,
     DEFAULT_ANUBIS_USER,
@@ -298,6 +299,65 @@ def test_upgrade_real():
     steps_text = " ".join(result.steps)
     assert "Downloaded" in steps_text
     assert "Restarted" in steps_text
+
+
+# --- restart ------------------------------------------------------------------
+
+
+def test_restart_dry_run():
+    r = _base_runner()
+    result = cmd_restart(runner=r, dry_run=True)
+    assert result.success
+    steps_text = " ".join(result.steps)
+    assert "rolling" in steps_text.lower()
+
+
+def test_restart_dry_run_no_rolling():
+    r = _base_runner()
+    result = cmd_restart(runner=r, dry_run=True, no_rolling=True)
+    assert result.success
+    steps_text = " ".join(result.steps)
+    assert "at once" in steps_text
+
+
+def test_restart_dry_run_no_instances():
+    r = _base_runner(**{
+        "sudo nine-manage-vhosts virtual-host list --json": VHOSTS_EMPTY,
+        "ss -tlnp": "",
+        "ls -d /home/www-*/ 2>/dev/null": "",
+    })
+    result = cmd_restart(runner=r, dry_run=True)
+    assert result.success
+    assert any("no instances" in s.lower() for s in result.steps)
+
+
+def test_restart_real():
+    r = _base_runner()
+    result = cmd_restart(runner=r)
+    assert result.success
+    steps_text = " ".join(result.steps)
+    assert "Restarted" in steps_text
+    assert "Health check" in steps_text
+
+
+def test_restart_real_no_rolling():
+    r = _base_runner()
+    result = cmd_restart(runner=r, no_rolling=True)
+    assert result.success
+    steps_text = " ".join(result.steps)
+    assert "Restarted" in steps_text
+    assert "Health check" not in steps_text
+
+
+def test_restart_no_instances():
+    r = _base_runner(**{
+        "sudo nine-manage-vhosts virtual-host list --json": VHOSTS_EMPTY,
+        "ss -tlnp": "",
+        "ls -d /home/www-*/ 2>/dev/null": "",
+    })
+    result = cmd_restart(runner=r)
+    assert result.success
+    assert any("no instances" in s.lower() for s in result.steps)
 
 
 # --- status -------------------------------------------------------------------

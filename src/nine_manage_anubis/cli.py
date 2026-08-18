@@ -23,6 +23,7 @@ from .commands import (
     cmd_enable,
     cmd_disable,
     cmd_upgrade,
+    cmd_restart,
     cmd_status,
     cmd_selftest,
     CommandResult,
@@ -78,6 +79,10 @@ def build_parser(settings: Settings) -> argparse.ArgumentParser:
     # upgrade
     p = sub.add_parser("upgrade", help="Download new Anubis binary and restart instances.")
     p.add_argument("--version", help="Target version (default: latest).")
+    p.add_argument("--no-rolling", action="store_true", help="Restart all instances at once.")
+
+    # restart
+    p = sub.add_parser("restart", help="Restart all Anubis instances (e.g. after policy changes).")
     p.add_argument("--no-rolling", action="store_true", help="Restart all instances at once.")
 
     # status
@@ -205,6 +210,15 @@ def main(argv: Sequence[str] | None = None, runner=None) -> int:
             anubis_user=anubis_user,
         )
         _print_result(result, dry_run, as_json, title="Upgrade:")
+
+    elif args.command == "restart":
+        result = cmd_restart(
+            runner=runner,
+            dry_run=dry_run,
+            no_rolling=args.no_rolling,
+            anubis_user=anubis_user,
+        )
+        _print_result(result, dry_run, as_json, title="Restart:")
 
     elif args.command == "status":
         instances, health_map = cmd_status(

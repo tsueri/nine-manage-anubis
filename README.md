@@ -204,6 +204,29 @@ nine-manage-anubis upgrade --no-rolling
 nine-manage-anubis --dry-run upgrade
 ```
 
+### `restart`
+
+Restart all Anubis instances without downloading a new binary. Use this after changing the shared policy file or any env file. By default, restarts one instance at a time with a health check after each — stops on failure.
+
+```
+nine-manage-anubis restart [--no-rolling]
+```
+
+| Flag | Description |
+|------|-------------|
+| `--no-rolling` | Restart all instances at once instead of one-by-one |
+
+```sh
+# Rolling restart (default) — one at a time with health check
+nine-manage-anubis restart
+
+# Restart all at once
+nine-manage-anubis restart --no-rolling
+
+# Dry run
+nine-manage-anubis --dry-run restart
+```
+
 ### `status`
 
 List all Anubis instances on the host. Discovers instances by combining vhost config (which ports are assigned), env files (which ports are claimed), and systemd (which services are running).

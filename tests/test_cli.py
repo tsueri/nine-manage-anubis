@@ -73,7 +73,7 @@ def _run(argv, runner=None):
 
 def test_parser_has_all_commands():
     parser = build_parser(Settings())
-    for cmd in ("install", "uninstall", "enable", "disable", "upgrade", "status", "self-test", "config"):
+    for cmd in ("install", "uninstall", "enable", "disable", "upgrade", "restart", "status", "self-test", "config"):
         args = parser.parse_args([cmd] if cmd not in ("enable", "disable") else [cmd, "x.com"])
         assert args.command == cmd
 
@@ -250,6 +250,27 @@ def test_upgrade_dry_run():
     rc, out, err = _run(["--dry-run", "upgrade"], runner=r)
     assert rc == 0
     assert "1.27.0" in out
+
+
+def test_restart_dry_run():
+    r = _runner()
+    rc, out, err = _run(["--dry-run", "restart"], runner=r)
+    assert rc == 0
+    assert "rolling" in out.lower()
+
+
+def test_restart_dry_run_no_rolling():
+    r = _runner()
+    rc, out, err = _run(["--dry-run", "restart", "--no-rolling"], runner=r)
+    assert rc == 0
+    assert "at once" in out.lower()
+
+
+def test_restart_real():
+    r = _runner()
+    rc, out, err = _run(["restart"], runner=r)
+    assert rc == 0
+    assert "Restarted" in out
 
 
 def test_self_test():

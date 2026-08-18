@@ -562,3 +562,65 @@ def cmd_selftest(
     if result.warnings:
         result.error = f"{len(result.warnings)} check(s) failed"
     return result
+
+
+# --- restart ------------------------------------------------------------------
+
+
+def cmd_restart(
+    runner: Runner = SubprocessRunner(),
+    dry_run: bool = False,
+    no_rolling: bool = False,
+    anubis_user: str = DEFAULT_ANUBIS_USER,
+) -> CommandResult:
+    result = CommandResult()
+
+    instances = discover_instances(runner=runner)
+    if not instances:
+        result.steps.append("No instances to restart")
+        return result
+
+    if dry_run:
+        if no_rolling:
+            result.steps.append(f"Would restart all {len(instances)} instances at once")
+        else:
+            result.steps.append(
+                f"Would rolling-restart {len(instances)} instances "
+                f"(one at a time with health check)"
+            )
+        return result
+
+    if no_rolling:
+        for inst in instances:
+            restart_service(anubis_user, inst.domain, runner=runner)
+            result.steps.append(f"Restarted anubis@{inst.domain}.service")
+    else:
+        for inst in instances:
+            restart_service(anubis_user, inst.domain, runner=runner)
+            result.steps.append(f"Restarted anubis@{inst.domain}.service")
+            state = is_active(anubis_user, inst.domain, runner=runner)
+            if state != "active":
+                result.warnings.append(
+                    f"anubis@{inst.domain}.service is {state} after restart — stopping"
+                )
+                result.error = f"Health check failed for {inst.domain} (service not active)"
+                return result
+            try:
+                response = runner(
+                    f"curl -s -o /dev/null -w '%{{http_code}}' "
+                    f"-H 'X-Real-Ip: 127.0.0.1' -H 'Host: {inst.domain}' "
+                    f"http://localhost:{inst.port}/"
+                )
+                code = response.strip().strip("'")
+                if code and code[0] in "23":
+                    result.steps.append(f"  Health check: active (HTTP {code})")
+                else:
+                    result.warnings.append(
+                        f"anubis@{inst.domain}.service HTTP probe returned {code}"
+                    )
+                    result.error = f"Health check failed for {inst.domain} (HTTP {code})"
+                    return result
+            except Exception:
+                result.steps.append(f"  Health check: active (service, HTTP probe skipped)")
+
+    return result
