@@ -32,9 +32,13 @@ def _format_status_table(
     if health_map is not None:
         headers.append("HEALTH")
 
+    ncols = len(headers)
+    vhost_col = headers.index("VHOSTS")
+
     rows = []
     for inst in instances:
-        vhosts_str = ", ".join(inst.vhosts) if inst.vhosts else inst.domain
+        vhosts = inst.vhosts if inst.vhosts else [inst.domain]
+        first = vhosts[0]
         row = [
             inst.domain,
             str(inst.port),
@@ -42,11 +46,15 @@ def _format_status_table(
             inst.user,
             inst.service_state,
             inst.version or "unknown",
-            vhosts_str,
+            first,
         ]
         if health_map is not None:
             row.append(health_map.get(inst.domain, "unknown"))
         rows.append(row)
+        for vh in vhosts[1:]:
+            sub = [""] * ncols
+            sub[vhost_col] = vh
+            rows.append(sub)
 
     return _format_table(headers, rows)
 
