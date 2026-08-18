@@ -256,7 +256,8 @@ def _print_result(result, dry_run: bool, as_json: bool, title: str = ""):
         return
 
     if dry_run:
-        print(format_dry_run(result.steps, title=title))
+        dry_title = f"[DRY RUN] {title}" if title else "[DRY RUN]"
+        print(format_dry_run(result.steps, title=dry_title))
     else:
         print(format_steps(result.steps, title=title))
 
