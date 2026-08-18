@@ -134,6 +134,18 @@ def test_parser_enable_cutover_only():
     assert args.cutover_only is True
 
 
+def test_parser_enable_no_notify_services():
+    parser = build_parser(Settings())
+    args = parser.parse_args(["enable", "--all", "--user", "www-example", "--no-notify-services"])
+    assert args.no_notify_services is True
+
+
+def test_parser_disable_no_notify_services():
+    parser = build_parser(Settings())
+    args = parser.parse_args(["disable", "--all", "--user", "www-example", "--no-notify-services"])
+    assert args.no_notify_services is True
+
+
 def test_parser_status_domain():
     parser = build_parser(Settings())
     args = parser.parse_args(["status", "--domain", "a.com"])
@@ -218,6 +230,44 @@ def test_resolve_domains_skip_no_match():
     r = _runner()
     domains = _resolve_domains(args, r)
     assert "example.com" in domains
+
+
+def test_enable_no_notify_services_passes_flag_and_reloads():
+    """--no-notify-services adds --no-notify-services to vhost update
+    and does a single webserver reload at the end of the batch."""
+    r = _runner()
+    rc, out, err = _run(
+        ["enable", "example.com", "--no-notify-services"],
+        runner=r,
+    )
+    assert rc == 0
+    # The vhost update command should include --no-notify-services
+    update_calls = [c for c in r.calls if "virtual-host update" in c]
+    assert any("--no-notify-services" in c for c in update_calls)
+    # A single webserver reload should have been called
+    reload_calls = [c for c in r.calls if "webserver reload" in c]
+    assert len(reload_calls) == 1
+
+
+def test_enable_without_no_notify_does_not_reload():
+    """Without --no-notify-services, no batch webserver reload is issued."""
+    r = _runner()
+    rc, out, err = _run(["enable", "example.com"], runner=r)
+    assert rc == 0
+    reload_calls = [c for c in r.calls if "webserver reload" in c]
+    assert len(reload_calls) == 0
+
+
+def test_enable_no_notify_dry_run_skips_reload():
+    """--no-notify-services with --dry-run should not reload."""
+    r = _runner()
+    rc, out, err = _run(
+        ["--dry-run", "enable", "example.com", "--no-notify-services"],
+        runner=r,
+    )
+    assert rc == 0
+    reload_calls = [c for c in r.calls if "webserver reload" in c]
+    assert len(reload_calls) == 0
 
 
 # --- Command dispatch ---------------------------------------------------------

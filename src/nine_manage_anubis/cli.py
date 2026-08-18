@@ -30,6 +30,7 @@ from .commands import (
     CommandResult,
 )
 from .output import format_status, format_steps, format_dry_run
+from .vhosts import webserver_reload
 from .ports import _parse_vhosts_json
 from .settings import Settings, load_settings, default_config_path, default_config_content
 
@@ -72,6 +73,8 @@ def build_parser(settings: Settings) -> argparse.ArgumentParser:
     p.add_argument("--user", help="Website user to filter --all by.")
     p.add_argument("--skip", action="append", default=[], metavar="PATTERN",
                    help="Skip domains matching glob pattern (e.g. 'vorlage*', '*.test'). Repeatable.")
+    p.add_argument("--no-notify-services", action="store_true",
+                   help="Skip Apache reload on each vhost change; reload once at end of batch.")
 
     # disable
     p = sub.add_parser("disable", help="Remove Anubis protection from a vhost.")
@@ -80,6 +83,8 @@ def build_parser(settings: Settings) -> argparse.ArgumentParser:
     p.add_argument("--user", help="Website user to filter --all by.")
     p.add_argument("--skip", action="append", default=[], metavar="PATTERN",
                    help="Skip domains matching glob pattern (e.g. 'vorlage*', '*.test'). Repeatable.")
+    p.add_argument("--no-notify-services", action="store_true",
+                   help="Skip Apache reload on each vhost change; reload once at end of batch.")
 
     # upgrade
     p = sub.add_parser("upgrade", help="Download new Anubis binary and restart instances.")
@@ -174,7 +179,9 @@ def main(argv: Sequence[str] | None = None, runner=None) -> int:
         if not domains:
             print("No domains to enable.", file=sys.stderr)
             return 1
+        no_notify = args.no_notify_services
         any_error = False
+        any_changes = False
         for domain in domains:
             try:
                 result = cmd_enable(
@@ -185,12 +192,18 @@ def main(argv: Sequence[str] | None = None, runner=None) -> int:
                     cutover_only=args.cutover_only,
                     anubis_user=anubis_user,
                     policy_file=settings.policy_file,
+                    no_notify=no_notify,
                 )
             except Exception as e:
                 result = CommandResult(error=f"Unexpected error: {e}")
             _print_result(result, dry_run, as_json, title=f"Enable {domain}:")
             if not result.success:
                 any_error = True
+            if result.steps:
+                any_changes = True
+        if no_notify and any_changes and not dry_run:
+            webserver_reload(runner=runner)
+            print("Apache reloaded once after batch.")
         return 1 if any_error else 0
 
     elif args.command == "disable":
@@ -198,7 +211,9 @@ def main(argv: Sequence[str] | None = None, runner=None) -> int:
         if not domains:
             print("No domains to disable.", file=sys.stderr)
             return 1
+        no_notify = args.no_notify_services
         any_error = False
+        any_changes = False
         for domain in domains:
             try:
                 result = cmd_disable(
@@ -206,12 +221,18 @@ def main(argv: Sequence[str] | None = None, runner=None) -> int:
                     runner=runner,
                     dry_run=dry_run,
                     anubis_user=anubis_user,
+                    no_notify=no_notify,
                 )
             except Exception as e:
                 result = CommandResult(error=f"Unexpected error: {e}")
             _print_result(result, dry_run, as_json, title=f"Disable {domain}:")
             if not result.success:
                 any_error = True
+            if result.steps:
+                any_changes = True
+        if no_notify and any_changes and not dry_run:
+            webserver_reload(runner=runner)
+            print("Apache reloaded once after batch.")
         return 1 if any_error else 0
 
     elif args.command == "upgrade":

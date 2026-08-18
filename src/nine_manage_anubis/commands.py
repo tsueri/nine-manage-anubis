@@ -190,6 +190,7 @@ def cmd_enable(
     cutover_only: bool = False,
     anubis_user: str = DEFAULT_ANUBIS_USER,
     policy_file: str | None = None,
+    no_notify: bool = False,
 ) -> CommandResult:
     result = CommandResult()
 
@@ -231,8 +232,8 @@ def cmd_enable(
                 if not certificate_exists(domain, runner=runner):
                     create_certificate(domain, runner=runner)
                     result.steps.append(f"Created Let's Encrypt certificate for {domain}")
-                switch_to_proxy(domain, alloc.app_port, runner=runner)
-                undo_stack.append(lambda: switch_to_default(domain, runner=runner))
+                switch_to_proxy(domain, alloc.app_port, no_notify=no_notify, runner=runner)
+                undo_stack.append(lambda: switch_to_default(domain, no_notify=no_notify, runner=runner))
                 result.steps.append(f"Switched {domain} to proxy template (PROXYPORT={alloc.app_port})")
             except Exception as e:
                 _fail_with_rollback(undo_stack, result, e)
@@ -290,8 +291,8 @@ def cmd_enable(
                 apply_fixups(webroot, ops, dry_run=False)
                 undo_stack.append(lambda: restore_fixups(webroot, ops, dry_run=False))
 
-                create_origin_vhost(domain, website_user, webroot, php_version, runner=runner)
-                undo_stack.append(lambda: remove_origin_vhost(domain, runner=runner))
+                create_origin_vhost(domain, website_user, webroot, php_version, no_notify=no_notify, runner=runner)
+                undo_stack.append(lambda: remove_origin_vhost(domain, no_notify=no_notify, runner=runner))
 
                 enable_service(anubis_user, domain, runner=runner)
                 undo_stack.append(lambda: disable_service(anubis_user, domain, runner=runner))
@@ -307,8 +308,8 @@ def cmd_enable(
                 if not certificate_exists(domain, runner=runner):
                     create_certificate(domain, runner=runner)
                     result.steps.append(f"Created Let's Encrypt certificate for {domain}")
-                switch_to_proxy(domain, alloc.app_port, runner=runner)
-                undo_stack.append(lambda: switch_to_default(domain, runner=runner))
+                switch_to_proxy(domain, alloc.app_port, no_notify=no_notify, runner=runner)
+                undo_stack.append(lambda: switch_to_default(domain, no_notify=no_notify, runner=runner))
                 result.steps.append(f"Cut over {domain} to proxy template (PROXYPORT={alloc.app_port})")
             except Exception as e:
                 _fail_with_rollback(undo_stack, result, e)
@@ -325,6 +326,7 @@ def cmd_disable(
     runner: Runner = SubprocessRunner(),
     dry_run: bool = False,
     anubis_user: str = DEFAULT_ANUBIS_USER,
+    no_notify: bool = False,
 ) -> CommandResult:
     result = CommandResult()
 
@@ -361,14 +363,14 @@ def cmd_disable(
             )
         return result
 
-    switch_to_default(domain, runner=runner)
+    switch_to_default(domain, no_notify=no_notify, runner=runner)
     result.steps.append(f"Switched {domain} back to default_letsencrypt_https")
 
     if is_last:
         disable_service(anubis_user, domain, runner=runner)
         result.steps.append(f"Stopped + disabled anubis@{domain}.service")
 
-        remove_origin_vhost(domain, runner=runner)
+        remove_origin_vhost(domain, no_notify=no_notify, runner=runner)
         result.steps.append(f"Removed origin vhost origin-{domain}")
 
         ops = RemoteFileOps(vh["user"], runner)

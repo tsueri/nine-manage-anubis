@@ -27,6 +27,7 @@ def create_vhost(
     template: str = DEFAULT_TEMPLATE,
     webroot: str | None = None,
     template_variables: dict[str, str] | None = None,
+    no_notify: bool = False,
     runner: Runner = SubprocessRunner(),
 ) -> str:
     parts = [
@@ -40,6 +41,8 @@ def create_vhost(
     if template_variables:
         for key, val in template_variables.items():
             parts.append(f"--template-variable={key}={val}")
+    if no_notify:
+        parts.append("--no-notify-services")
     return runner(" ".join(parts))
 
 
@@ -47,6 +50,7 @@ def update_vhost(
     domain: str,
     template: str | None = None,
     template_variables: dict[str, str] | None = None,
+    no_notify: bool = False,
     runner: Runner = SubprocessRunner(),
 ) -> str:
     parts = ["sudo nine-manage-vhosts virtual-host update", domain]
@@ -55,11 +59,24 @@ def update_vhost(
     if template_variables:
         for key, val in template_variables.items():
             parts.append(f"--template-variable={key}={val}")
+    if no_notify:
+        parts.append("--no-notify-services")
     return runner(" ".join(parts))
 
 
-def remove_vhost(domain: str, runner: Runner = SubprocessRunner()) -> str:
-    return runner(f"sudo nine-manage-vhosts virtual-host remove {domain}")
+def remove_vhost(
+    domain: str,
+    no_notify: bool = False,
+    runner: Runner = SubprocessRunner(),
+) -> str:
+    cmd = f"sudo nine-manage-vhosts virtual-host remove {domain}"
+    if no_notify:
+        cmd += " --no-notify-services"
+    return runner(cmd)
+
+
+def webserver_reload(runner: Runner = SubprocessRunner()) -> str:
+    return runner("sudo nine-manage-vhosts webserver reload")
 
 
 def create_origin_vhost(
@@ -67,6 +84,7 @@ def create_origin_vhost(
     user: str,
     webroot: str,
     php_version: str | None = None,
+    no_notify: bool = False,
     runner: Runner = SubprocessRunner(),
 ) -> str:
     origin_domain = f"origin-{domain}"
@@ -79,25 +97,45 @@ def create_origin_vhost(
         template=ORIGIN_TEMPLATE,
         webroot=webroot,
         template_variables=tv or None,
+        no_notify=no_notify,
         runner=runner,
     )
 
 
-def remove_origin_vhost(domain: str, runner: Runner = SubprocessRunner()) -> str:
-    return remove_vhost(f"origin-{domain}", runner)
+def remove_origin_vhost(
+    domain: str,
+    no_notify: bool = False,
+    runner: Runner = SubprocessRunner(),
+) -> str:
+    return remove_vhost(f"origin-{domain}", no_notify=no_notify, runner=runner)
 
 
-def switch_to_proxy(domain: str, proxyport: int, runner: Runner = SubprocessRunner()) -> str:
+def switch_to_proxy(
+    domain: str,
+    proxyport: int,
+    no_notify: bool = False,
+    runner: Runner = SubprocessRunner(),
+) -> str:
     return update_vhost(
         domain,
         template=PROXY_TEMPLATE,
         template_variables={"PROXYPORT": str(proxyport)},
+        no_notify=no_notify,
         runner=runner,
     )
 
 
-def switch_to_default(domain: str, runner: Runner = SubprocessRunner()) -> str:
-    return update_vhost(domain, template=DEFAULT_LE_TEMPLATE, runner=runner)
+def switch_to_default(
+    domain: str,
+    no_notify: bool = False,
+    runner: Runner = SubprocessRunner(),
+) -> str:
+    return update_vhost(
+        domain,
+        template=DEFAULT_LE_TEMPLATE,
+        no_notify=no_notify,
+        runner=runner,
+    )
 
 
 # --- Certificate operations ---------------------------------------------------
