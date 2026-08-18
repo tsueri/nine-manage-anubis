@@ -509,3 +509,41 @@ def test_enable_reused_webroot_rollback_on_cutover_failure():
     result = cmd_enable("blog.example.ch", runner=failing_runner)
     assert not result.success
     assert "rollback" in result.error.lower() or "rolled back" in result.error.lower()
+
+
+def test_enable_reuse_creates_certificate_if_missing():
+    """Reused webroot path must check/create cert before switch_to_proxy.
+
+    A domain sharing a webroot with an already-Anubis-protected site still
+    needs its own Let's Encrypt certificate for the proxy template.
+    """
+    vhosts = """[
+      {"domain": "example.ch", "user": "www-example", "webroot": "/home/www-example/example.ch", "template": "proxy_letsencrypt_https_redirect", "template_variables": {"PROXYPORT": "7014"}, "aliases": [], "jobs": []},
+      {"domain": "blog.example.ch", "user": "www-example", "webroot": "/home/www-example/example.ch", "template": "default_letsencrypt_https", "template_variables": {"PHP_VERSION": "8.2"}, "aliases": [], "jobs": []}
+    ]"""
+    cert_list_without_sp_studen = """test.example.ch
+================
+       DOMAIN: test.example.ch
+  VALID UNTIL: 2026-12-01
+"""
+    r = _base_runner(**{
+        "sudo nine-manage-vhosts virtual-host list --json": vhosts,
+        "sudo nine-manage-vhosts certificate list": cert_list_without_sp_studen,
+        "ss -tlnp": "LISTEN 0 4096 0.0.0.0:7014 0.0.0.0:* users:((\"anubis\",pid=1,fd=3))\n",
+        _SU + "ls ~/.config/anubis/*.env 2>/dev/null": "/home/www-anubis/.config/anubis/example.ch.env\n",
+        _SU + "cat '/home/www-anubis/.config/anubis/example.ch.env'": "BIND=:7014\nMETRICS_BIND=:7015\nTARGET_HOST=origin-example.ch\n",
+    })
+
+    cert_commands = []
+    original_run = r
+
+    def tracking_runner(cmd: str) -> str:
+        if "certificate create" in cmd:
+            cert_commands.append(cmd)
+        return original_run(cmd)
+
+    result = cmd_enable("blog.example.ch", runner=tracking_runner)
+    assert result.success
+    assert any("certificate" in s.lower() and "created" in s.lower() for s in result.steps)
+    assert len(cert_commands) == 1
+    assert "blog.example.ch" in cert_commands[0]

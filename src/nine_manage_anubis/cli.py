@@ -117,12 +117,14 @@ def _resolve_domains(args: argparse.Namespace, runner) -> list[str]:
             vh["domain"] for vh in vhosts
             if vh.get("user") == user
             and vh.get("template") != "proxy_letsencrypt_https_redirect"
+            and not vh["domain"].startswith("origin-")
         ]
     elif args.command == "disable":
         return [
             vh["domain"] for vh in vhosts
             if vh.get("user") == user
             and vh.get("template") == "proxy_letsencrypt_https_redirect"
+            and not vh["domain"].startswith("origin-")
         ]
     return []
 

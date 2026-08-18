@@ -228,6 +228,9 @@ def cmd_enable(
         if not prepare_only:
             undo_stack: list = []
             try:
+                if not certificate_exists(domain, runner=runner):
+                    create_certificate(domain, runner=runner)
+                    result.steps.append(f"Created Let's Encrypt certificate for {domain}")
                 switch_to_proxy(domain, alloc.app_port, runner=runner)
                 undo_stack.append(lambda: switch_to_default(domain, runner=runner))
                 result.steps.append(f"Switched {domain} to proxy template (PROXYPORT={alloc.app_port})")

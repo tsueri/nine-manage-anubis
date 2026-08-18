@@ -252,6 +252,17 @@ def next_free_pair(runner: Runner = SubprocessRunner()) -> tuple[int, int]:
     raise RuntimeError(f"No free port pair in range {PORT_RANGE_START}-{PORT_RANGE_END}")
 
 
+def find_port_for_domain(
+    domain: str, runner: Runner = SubprocessRunner()
+) -> int | None:
+    """Find the port allocated for a domain from its env file."""
+    claimed = get_claimed_ports(runner)
+    for port, (user, dom) in claimed.items():
+        if dom == domain:
+            return port
+    return None
+
+
 def allocate_for_domain(
     domain: str, runner: Runner = SubprocessRunner()
 ) -> PortAllocation:
@@ -274,6 +285,14 @@ def allocate_for_domain(
                 metrics_port=existing + 1,
                 reused_from=primary,
             )
+
+    # An env file from --prepare-only already has the port we need.
+    existing_port = find_port_for_domain(domain, runner)
+    if existing_port is not None:
+        return PortAllocation(
+            app_port=existing_port,
+            metrics_port=existing_port + 1,
+        )
 
     app, metrics = next_free_pair(runner)
     return PortAllocation(app_port=app, metrics_port=metrics)

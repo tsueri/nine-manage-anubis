@@ -162,6 +162,18 @@ def test_resolve_domains_all_enable():
     assert "test.example.ch" not in domains  # already behind Anubis
 
 
+def test_resolve_domains_all_enable_excludes_origin():
+    """origin-* vhosts must never be picked up by --all.
+
+    They are internal backend vhosts created during the prepare step,
+    not public-facing sites that should be put behind Anubis.
+    """
+    args = argparse.Namespace(all=True, user="www-anubis", domains=[], command="enable")
+    r = _runner()
+    domains = _resolve_domains(args, r)
+    assert "origin-test.example.ch" not in domains
+
+
 def test_resolve_domains_all_disable():
     args = argparse.Namespace(all=True, user="www-anubis", domains=[], command="disable")
     r = _runner()

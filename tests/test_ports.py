@@ -27,6 +27,7 @@ from nine_manage_anubis.ports import (
     _all_used_ports,
     next_free_pair,
     allocate_for_domain,
+    find_port_for_domain,
 )
 
 # --- Sample data --------------------------------------------------------------
@@ -306,3 +307,34 @@ def test_allocate_for_domain_not_found():
         assert False, "should have raised"
     except ValueError:
         pass
+
+
+def test_find_port_for_domain():
+    r = _runner_with_data()
+    assert find_port_for_domain("example.ch", r) == 7014
+    assert find_port_for_domain("app.example.ch", r) == 7012
+    assert find_port_for_domain("nonexistent.com", r) is None
+
+
+def test_allocate_for_domain_with_existing_env_file():
+    """A prepared-but-not-yet-cut-over domain must reuse its env-file port.
+
+    This is the --prepare-only then --cutover-only scenario: the vhost
+    template is still default_letsencrypt_https, but an env file exists
+    from the prepare step. allocate_for_domain must read the port from
+    the env file rather than allocating a new pair.
+    """
+    env_example = "BIND=:7020\nMETRICS_BIND=:7021\nTARGET_HOST=origin-example.com\n"
+    r = _runner_with_data(**{
+        _su_key("ls ~/.config/anubis/*.env 2>/dev/null"): (
+            "/home/www-anubis/.config/anubis/test.example.ch.env\n"
+            "/home/www-anubis/.config/anubis/example.ch.env\n"
+            "/home/www-anubis/.config/anubis/app.example.ch.env\n"
+            "/home/www-anubis/.config/anubis/example.com.env\n"
+        ),
+        _su_key("cat '/home/www-anubis/.config/anubis/example.com.env'"): env_example,
+    })
+    alloc = allocate_for_domain("example.com", r)
+    assert not alloc.is_reused
+    assert alloc.app_port == 7020
+    assert alloc.metrics_port == 7021
