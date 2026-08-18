@@ -30,9 +30,9 @@ class AnubisConfig:
         return f"/home/{self.anubis_user}/.config/anubis/{self.domain}.env"
 
 
-def generate_env_file(config: AnubisConfig) -> str:
+def generate_env_file(config: AnubisConfig, policy_file: str | None = None) -> str:
     """Generate the env file content for an Anubis instance."""
-    return (
+    content = (
         f"# --- Anubis instance for {config.domain} ---\n"
         f"# public vhost  : {config.domain}\n"
         f"# origin vhost  : {config.origin_domain}\n"
@@ -52,6 +52,13 @@ def generate_env_file(config: AnubisConfig) -> str:
         f"# JWT signing key.\n"
         f"ED25519_PRIVATE_KEY_HEX_FILE={config.key_path}\n"
     )
+    if policy_file:
+        content += (
+            f"\n"
+            f"# Bot policy (shared across all instances — edit one file to update all).\n"
+            f"POLICY_FNAME={policy_file}\n"
+        )
+    return content
 
 
 SYSTEMD_TEMPLATE = """\

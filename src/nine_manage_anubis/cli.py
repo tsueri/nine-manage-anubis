@@ -1,10 +1,13 @@
 """CLI argument parsing and command dispatch.
 
 Uses argparse (stdlib) for the command surface:
-  install / uninstall / enable / disable / upgrade / status
+  install / uninstall / enable / disable / upgrade / status / self-test / config
 
 Global flags: --dry-run, --json, --anubis-user
 Domain targeting: positional args or --all --user <user>
+
+Defaults loaded from ~/.config/nine-manage-anubis/config.json (see settings.py).
+CLI flags override config file values.
 """
 
 from __future__ import annotations
@@ -22,13 +25,13 @@ from .commands import (
     cmd_upgrade,
     cmd_status,
     cmd_selftest,
-    DEFAULT_ANUBIS_USER,
 )
 from .output import format_status, format_steps, format_dry_run
 from .ports import _parse_vhosts_json
+from .settings import Settings, load_settings, default_config_path, default_config_content
 
 
-def build_parser() -> argparse.ArgumentParser:
+def build_parser(settings: Settings) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="nine-manage-anubis",
         description="Manage Anubis bot protection on nine.ch Managed Servers.",
@@ -42,15 +45,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Output results as JSON.",
     )
     parser.add_argument(
-        "--anubis-user", default=DEFAULT_ANUBIS_USER,
-        help=f"Anubis system user (default: {DEFAULT_ANUBIS_USER}).",
+        "--anubis-user", default=settings.anubis_user,
+        help=f"Anubis system user (default: {settings.anubis_user}).",
     )
 
     sub = parser.add_subparsers(dest="command", required=True)
 
     # install
     p = sub.add_parser("install", help="Set up Anubis infrastructure (user, binary, systemd template).")
-    p.add_argument("--version", default="1.27.0", help="Anubis version to install.")
+    p.add_argument("--version", default=settings.anubis_version, help="Anubis version to install.")
+    p.add_argument("--init-policy", action="store_true",
+                   help="Extract default bot policy to the configured policy_file path.")
 
     # uninstall
     sub.add_parser("uninstall", help="Remove Anubis infrastructure. Refuses if instances exist.")
@@ -81,6 +86,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     # self-test
     sub.add_parser("self-test", help="Verify Anubis infrastructure health.")
+
+    # config
+    p = sub.add_parser("config", help="Show current settings and config file location.")
+    p.add_argument("--init", action="store_true", help="Create a default config file.")
 
     return parser
 
@@ -113,7 +122,8 @@ def _resolve_domains(args: argparse.Namespace, runner) -> list[str]:
 
 
 def main(argv: Sequence[str] | None = None, runner=None) -> int:
-    parser = build_parser()
+    settings = load_settings()
+    parser = build_parser(settings)
     args = parser.parse_args(argv)
     if runner is None:
         runner = SubprocessRunner()
@@ -127,6 +137,8 @@ def main(argv: Sequence[str] | None = None, runner=None) -> int:
             version=args.version,
             runner=runner,
             dry_run=dry_run,
+            policy_file=settings.policy_file,
+            init_policy=args.init_policy,
         )
         _print_result(result, dry_run, as_json, title="Install:")
 
@@ -152,6 +164,7 @@ def main(argv: Sequence[str] | None = None, runner=None) -> int:
                 prepare_only=args.prepare_only,
                 cutover_only=args.cutover_only,
                 anubis_user=anubis_user,
+                policy_file=settings.policy_file,
             )
             _print_result(result, dry_run, as_json, title=f"Enable {domain}:")
             if not result.success:
@@ -202,7 +215,26 @@ def main(argv: Sequence[str] | None = None, runner=None) -> int:
         )
         _print_result(result, dry_run, as_json, title="Self-test:")
 
+    elif args.command == "config":
+        _cmd_config(settings, args)
+
     return 0
+
+
+def _cmd_config(settings: Settings, args: argparse.Namespace) -> None:
+    path = default_config_path()
+    if args.init:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(default_config_content(settings.anubis_user))
+        print(f"Created config file: {path}")
+        return
+    exists = "exists" if path.exists() else "does not exist"
+    print(f"Config file: {path} ({exists})")
+    print()
+    print(f"  anubis_user:    {settings.anubis_user}")
+    print(f"  anubis_version: {settings.anubis_version}")
+    pf = settings.policy_file or "(not set — instances use embedded default policy)"
+    print(f"  policy_file:    {pf}")
 
 
 def _print_result(result, dry_run: bool, as_json: bool, title: str = ""):

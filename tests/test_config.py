@@ -41,6 +41,19 @@ def test_generate_env_file():
     assert "COOKIE_PARTITIONED=false" in env
     assert "ED25519_PRIVATE_KEY_HEX_FILE=/home/www-anubis/.config/anubis/example.com.key" in env
     assert "example.com" in env
+    assert "POLICY_FNAME" not in env
+
+
+def test_generate_env_file_with_policy():
+    c = AnubisConfig(
+        domain="example.com",
+        app_port=7010,
+        metrics_port=7011,
+        anubis_user="www-anubis",
+        key_path="/home/www-anubis/.config/anubis/example.com.key",
+    )
+    env = generate_env_file(c, policy_file="/home/www-anubis/.config/anubis/shared-policy.yaml")
+    assert "POLICY_FNAME=/home/www-anubis/.config/anubis/shared-policy.yaml" in env
 
 
 def test_generate_env_file_different_domain():

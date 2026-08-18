@@ -6,6 +6,7 @@ from contextlib import redirect_stdout, redirect_stderr
 
 from nine_manage_anubis.runner import FakeRunner
 from nine_manage_anubis.cli import main, build_parser, _resolve_domains
+from nine_manage_anubis.settings import Settings
 
 import argparse
 
@@ -71,76 +72,76 @@ def _run(argv, runner=None):
 
 
 def test_parser_has_all_commands():
-    parser = build_parser()
-    for cmd in ("install", "uninstall", "enable", "disable", "upgrade", "status", "self-test"):
-        args = parser.parse_args([cmd] if cmd != "enable" else [cmd, "x.com"])
+    parser = build_parser(Settings())
+    for cmd in ("install", "uninstall", "enable", "disable", "upgrade", "status", "self-test", "config"):
+        args = parser.parse_args([cmd] if cmd not in ("enable", "disable") else [cmd, "x.com"])
         assert args.command == cmd
 
 
 def test_parser_enable_with_domains():
-    parser = build_parser()
+    parser = build_parser(Settings())
     args = parser.parse_args(["enable", "a.com", "b.com"])
     assert args.command == "enable"
     assert args.domains == ["a.com", "b.com"]
 
 
 def test_parser_enable_with_all_and_user():
-    parser = build_parser()
+    parser = build_parser(Settings())
     args = parser.parse_args(["enable", "--all", "--user", "www-example"])
     assert args.all is True
     assert args.user == "www-example"
 
 
 def test_parser_dry_run():
-    parser = build_parser()
+    parser = build_parser(Settings())
     args = parser.parse_args(["--dry-run", "status"])
     assert args.dry_run is True
 
 
 def test_parser_json():
-    parser = build_parser()
+    parser = build_parser(Settings())
     args = parser.parse_args(["--json", "status"])
     assert args.json is True
 
 
 def test_parser_anubis_user():
-    parser = build_parser()
+    parser = build_parser(Settings())
     args = parser.parse_args(["--anubis-user", "custom-user", "status"])
     assert args.anubis_user == "custom-user"
 
 
 def test_parser_upgrade_version():
-    parser = build_parser()
+    parser = build_parser(Settings())
     args = parser.parse_args(["upgrade", "--version", "1.26.0"])
     assert args.version == "1.26.0"
 
 
 def test_parser_upgrade_no_rolling():
-    parser = build_parser()
+    parser = build_parser(Settings())
     args = parser.parse_args(["upgrade", "--no-rolling"])
     assert args.no_rolling is True
 
 
 def test_parser_enable_prepare_only():
-    parser = build_parser()
+    parser = build_parser(Settings())
     args = parser.parse_args(["enable", "a.com", "--prepare-only"])
     assert args.prepare_only is True
 
 
 def test_parser_enable_cutover_only():
-    parser = build_parser()
+    parser = build_parser(Settings())
     args = parser.parse_args(["enable", "a.com", "--cutover-only"])
     assert args.cutover_only is True
 
 
 def test_parser_status_domain():
-    parser = build_parser()
+    parser = build_parser(Settings())
     args = parser.parse_args(["status", "--domain", "a.com"])
     assert args.domain == "a.com"
 
 
 def test_parser_status_health():
-    parser = build_parser()
+    parser = build_parser(Settings())
     args = parser.parse_args(["status", "--health"])
     assert args.health is True
 
@@ -275,3 +276,45 @@ def test_self_test_failure_shows_detail():
     assert "User www-anubis exists" in out
     assert "not active" in err.lower() or "failed" in err.lower()
     assert "check(s) failed" in err
+
+
+def test_config_shows_settings():
+    rc, out, err = _run(["config"])
+    assert rc == 0
+    assert "anubis_user" in out
+    assert "www-anubis" in out
+    assert "policy_file" in out
+
+
+def test_config_init_creates_file(tmp_path, monkeypatch):
+    import nine_manage_anubis.settings as settings_mod
+    monkeypatch.setattr(settings_mod, "default_config_path", lambda: tmp_path / "config.json")
+    monkeypatch.setattr("nine_manage_anubis.cli.default_config_path", lambda: tmp_path / "config.json")
+    rc, out, err = _run(["config", "--init"])
+    assert rc == 0
+    assert "Created config file" in out
+    config_file = tmp_path / "config.json"
+    assert config_file.exists()
+    import json
+    data = json.loads(config_file.read_text())
+    assert data["anubis_user"] == "www-anubis"
+    assert "policy_file" in data
+
+
+def test_settings_provide_defaults(tmp_path, monkeypatch):
+    """Config file values should be used as argparse defaults."""
+    import nine_manage_anubis.settings as settings_mod
+    config = tmp_path / "config.json"
+    config.write_text(json.dumps({
+        "anubis_user": "www-data",
+        "anubis_version": "1.30.0",
+        "policy_file": "/home/www-data/.config/anubis/policy.yaml",
+    }))
+    monkeypatch.setattr(settings_mod, "default_config_path", lambda: config)
+    settings = settings_mod.load_settings()
+    assert settings.anubis_user == "www-data"
+    assert settings.anubis_version == "1.30.0"
+    assert settings.policy_file == "/home/www-data/.config/anubis/policy.yaml"
+    parser = build_parser(settings)
+    args = parser.parse_args(["install"])
+    assert args.version == "1.30.0"

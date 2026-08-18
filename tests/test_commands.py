@@ -92,6 +92,39 @@ def test_install_user_exists():
     assert any("already exists" in s for s in result.steps)
 
 
+def test_install_init_policy():
+    r = _base_runner()
+    result = cmd_install(
+        runner=r,
+        policy_file="/home/www-anubis/.config/anubis/shared-policy.yaml",
+        init_policy=True,
+    )
+    assert result.success
+    assert any("Extracted default bot policy" in s for s in result.steps)
+
+
+def test_install_init_policy_no_policy_file_warns():
+    r = _base_runner()
+    result = cmd_install(
+        runner=r,
+        init_policy=True,
+    )
+    assert result.success
+    assert any("no policy_file" in w for w in result.warnings)
+
+
+def test_install_init_policy_dry_run():
+    r = _base_runner()
+    result = cmd_install(
+        runner=r,
+        dry_run=True,
+        policy_file="/home/www-anubis/.config/anubis/shared-policy.yaml",
+        init_policy=True,
+    )
+    assert result.success
+    assert any("Would extract" in s for s in result.steps)
+
+
 # --- uninstall ----------------------------------------------------------------
 
 

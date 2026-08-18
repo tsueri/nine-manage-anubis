@@ -53,6 +53,7 @@ from .systemd import (
     download_binary,
     generate_key,
     get_latest_version,
+    extract_policy,
 )
 from .fixups import apply as apply_fixups, restore as restore_fixups
 from .fileops import RemoteFileOps
@@ -81,6 +82,8 @@ def cmd_install(
     version: str = ANUBIS_VERSION,
     runner: Runner = SubprocessRunner(),
     dry_run: bool = False,
+    policy_file: str | None = None,
+    init_policy: bool = False,
 ) -> CommandResult:
     result = CommandResult()
 
@@ -104,10 +107,20 @@ def cmd_install(
             result.steps.append("Installed systemd template anubis@.service")
         else:
             result.steps.append("Systemd template anubis@.service already exists")
+
+        if init_policy:
+            if not policy_file:
+                result.warnings.append(
+                    "--init-policy ignored: no policy_file in config")
+            else:
+                extract_policy(anubis_user, policy_file, runner=runner)
+                result.steps.append(f"Extracted default bot policy to {policy_file}")
     else:
         result.steps.append(f"Would create user {anubis_user} (if not exists)")
         result.steps.append(f"Would download Anubis binary v{version}")
         result.steps.append("Would install systemd template anubis@.service (if not exists)")
+        if init_policy and policy_file:
+            result.steps.append(f"Would extract default bot policy to {policy_file}")
 
     return result
 
@@ -176,6 +189,7 @@ def cmd_enable(
     prepare_only: bool = False,
     cutover_only: bool = False,
     anubis_user: str = DEFAULT_ANUBIS_USER,
+    policy_file: str | None = None,
 ) -> CommandResult:
     result = CommandResult()
 
@@ -237,7 +251,7 @@ def cmd_enable(
         key_content = generate_key(runner=runner)
         result.steps.append(f"Generated JWT key")
 
-        env_content = generate_env_file(config)
+        env_content = generate_env_file(config, policy_file=policy_file)
         result.steps.append(f"Prepared env file ({config.env_path})")
 
         if not template_exists(anubis_user, runner=runner):

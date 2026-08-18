@@ -152,3 +152,15 @@ def get_latest_version(runner: Runner = SubprocessRunner()) -> str:
     if m:
         return m.group(1)
     raise RuntimeError(f"Could not determine latest Anubis version from: {raw}")
+
+
+def extract_policy(user: str, dest_path: str, runner: Runner = SubprocessRunner()) -> str:
+    """Extract default bot policy from Anubis binary to dest_path."""
+    script = (
+        f"mkdir -p '$(dirname \"{dest_path}\")'\n"
+        f"cd /tmp\n"
+        f"~/bin/anubis -extract-resources /tmp/anubis-extract-{user}\n"
+        f"cp /tmp/anubis-extract-{user}/data/botPolicies.yaml '{dest_path}'\n"
+        f"rm -rf /tmp/anubis-extract-{user}\n"
+    )
+    return nine_su(user, script, runner)
