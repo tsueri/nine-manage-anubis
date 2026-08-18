@@ -208,7 +208,7 @@ def discover_instances(
     for port in sorted(all_ports):
         if port < PORT_RANGE_START or port > PORT_RANGE_END:
             continue
-        user, domain = claimed.get(port, ("www-anubis", "unknown"))
+        user, domain = claimed.get(port, ("unknown", "unknown"))
         metrics_port = port + 1
         state = _get_service_state(user, domain, runner)
         vhost_list = port_vhosts.get(port, [])
