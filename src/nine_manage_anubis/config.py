@@ -48,6 +48,7 @@ def generate_env_file(config: AnubisConfig, policy_file: str | None = None) -> s
         f"# First-party cookie semantics (shipped default None/Partitioned breaks Safari).\n"
         f"COOKIE_SAME_SITE=Lax\n"
         f"COOKIE_PARTITIONED=false\n"
+        f"COOKIE_DYNAMIC_DOMAIN=true\n"
         f"\n"
         f"# JWT signing key.\n"
         f"ED25519_PRIVATE_KEY_HEX_FILE={config.key_path}\n"
