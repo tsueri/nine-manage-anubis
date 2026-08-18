@@ -4,6 +4,8 @@ CLI for managing [Anubis](https://github.com/TecharoHQ/anubis) bot protection on
 
 Automates the full Anubis lifecycle: installation, enabling/disabling protection for vhosts (with multisite detection, automated origin fixups, dynamic port discovery), batch operations, upgrades with rolling restart, status reporting, and self-test with automatic rollback on failure.
 
+For detailed documentation of every command and flag, see [docs/cli-reference.md](docs/cli-reference.md).
+
 ## Requirements
 
 - Python 3.10+ (stdlib only — no pip dependencies)
