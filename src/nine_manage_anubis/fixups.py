@@ -353,21 +353,11 @@ def restore(webroot: str, ops: FileOps, dry_run: bool = False) -> RestorePlan:
     chain_path = _webroot_path(webroot, "anubis-prepend-chain.php")
 
     if state.user_ini is not UserIniState.ABSENT:
-        backups = ops.glob_backups(user_ini_path)
-        if backups:
-            bak_content = ops.read(backups[0])
-            if bak_content is not None:
-                ops.write(user_ini_path, bak_content)
-        else:
+        if _restore_from_backup(ops, user_ini_path) is False:
             ops.unlink(user_ini_path)
 
     if state.htaccess is HtaccessState.PRESENT_WITH_BLOCK:
-        backups = ops.glob_backups(htaccess_path)
-        if backups:
-            bak_content = ops.read(backups[0])
-            if bak_content is not None:
-                ops.write(htaccess_path, bak_content)
-        else:
+        if _restore_from_backup(ops, htaccess_path) is False:
             text = ops.read(htaccess_path) or ""
             text = _strip_htaccess_block(text)
             if not text.strip():
@@ -381,6 +371,22 @@ def restore(webroot: str, ops: FileOps, dry_run: bool = False) -> RestorePlan:
         ops.unlink(chain_path)
 
     return rp
+
+
+def _restore_from_backup(ops: FileOps, path: str) -> bool | None:
+    """Restore a file from its most recent backup.
+
+    Returns True if restored, False if no backup exists,
+    None if a backup exists but is unreadable (caller should leave file as-is).
+    """
+    backups = ops.glob_backups(path)
+    if not backups:
+        return False
+    bak_content = ops.read(backups[0])
+    if bak_content is None:
+        return None
+    ops.write(path, bak_content)
+    return True
 
 
 def _strip_htaccess_block(text: str) -> str:

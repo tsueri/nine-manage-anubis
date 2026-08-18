@@ -6,7 +6,6 @@ No external dependencies. Table formatting uses simple string alignment.
 from __future__ import annotations
 
 import json
-from dataclasses import asdict
 from typing import Any
 
 from .ports import AnubisInstance

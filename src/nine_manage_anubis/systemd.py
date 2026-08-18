@@ -142,7 +142,6 @@ def download_binary(user: str, version: str, runner: Runner = SubprocessRunner()
 
 def get_latest_version(runner: Runner = SubprocessRunner()) -> str:
     """Fetch the latest Anubis release version from GitHub API."""
-    import json
     raw = runner(
         "curl -sL https://api.github.com/repos/TecharoHQ/anubis/releases/latest "
         "| grep -m1 '\"tag_name\"'"

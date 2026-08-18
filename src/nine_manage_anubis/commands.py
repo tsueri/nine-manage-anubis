@@ -48,7 +48,6 @@ from .systemd import (
     write_env_file,
     write_key_file,
     remove_file,
-    file_exists,
     binary_exists,
     binary_version,
     download_binary,
@@ -57,7 +56,6 @@ from .systemd import (
 )
 from .fixups import apply as apply_fixups, restore as restore_fixups
 from .fileops import RemoteFileOps
-from .nine_su import nine_su
 
 
 DEFAULT_ANUBIS_USER = "www-anubis"

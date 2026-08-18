@@ -24,7 +24,7 @@ from .commands import (
     DEFAULT_ANUBIS_USER,
 )
 from .output import format_status, format_steps, format_dry_run
-from .ports import get_vhost, _parse_vhosts_json
+from .ports import _parse_vhosts_json
 
 
 def build_parser() -> argparse.ArgumentParser:

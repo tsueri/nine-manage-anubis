@@ -8,7 +8,7 @@ outputs. Production uses SubprocessRunner.
 from __future__ import annotations
 
 import subprocess
-from typing import Callable, Protocol
+from typing import Callable
 
 Runner = Callable[[str], str]
 
