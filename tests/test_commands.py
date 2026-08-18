@@ -367,13 +367,14 @@ def test_selftest_instance_not_active():
     assert any("not active" in s.lower() or "failed" in s.lower() for s in result.warnings)
 
 
-def test_selftest_http_probe_fails():
+def test_selftest_http_probe_any_response_is_ok():
+    """Any HTTP response means Anubis is running and listening."""
     r = _base_runner(**{
         "curl -s -o /dev/null -w '%{http_code}'": "502",
     })
     result = cmd_selftest(runner=r)
-    assert not result.success
-    assert any("502" in s for s in result.warnings)
+    assert result.success
+    assert any("502" in s for s in result.steps)
 
 
 def test_selftest_dry_run():

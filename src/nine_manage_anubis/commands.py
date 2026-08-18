@@ -547,7 +547,7 @@ def cmd_selftest(
             code_str = response.strip().strip("'")
             try:
                 code = int(code_str)
-                ok = 200 <= code < 400
+                ok = code > 0
             except ValueError:
                 code = code_str
                 ok = False
