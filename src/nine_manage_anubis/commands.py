@@ -27,6 +27,7 @@ from .vhosts import (
     user_exists,
     certificate_exists,
     create_certificate,
+    PROXY_TEMPLATE,
 )
 from .config import (
     AnubisConfig,
@@ -172,8 +173,8 @@ def cmd_enable(
     tv = vh.get("template_variables", {})
     php_version = tv.get("PHP_VERSION")
 
-    if vh["template"] == "proxy_letsencrypt_https_redirect":
-        result.error = f"{domain} is already behind Anubis (template is proxy_letsencrypt_https_redirect)"
+    if vh["template"] == PROXY_TEMPLATE:
+        result.error = f"{domain} is already behind Anubis"
         return result
 
     alloc = allocate_for_domain(domain, runner=runner)
@@ -184,7 +185,8 @@ def cmd_enable(
             f"(port {alloc.app_port})"
         )
         if dry_run:
-            result.steps.append(f"Would switch {domain} to proxy template (PROXYPORT={alloc.app_port})")
+            if not prepare_only:
+                result.steps.append(f"Would switch {domain} to proxy template (PROXYPORT={alloc.app_port})")
             return result
 
         if not cutover_only:
@@ -193,8 +195,9 @@ def cmd_enable(
                 f"fixups should already be installed"
             )
 
-        switch_to_proxy(domain, alloc.app_port, runner=runner)
-        result.steps.append(f"Switched {domain} to proxy template (PROXYPORT={alloc.app_port})")
+        if not prepare_only:
+            switch_to_proxy(domain, alloc.app_port, runner=runner)
+            result.steps.append(f"Switched {domain} to proxy template (PROXYPORT={alloc.app_port})")
         return result
 
     config = AnubisConfig(
@@ -213,10 +216,12 @@ def cmd_enable(
         result.steps.append(f"Prepared env file ({config.env_path})")
 
         if not template_exists(anubis_user, runner=runner):
-            result.steps.append("Would install systemd template anubis@.service")
-            if not dry_run:
+            if dry_run:
+                result.steps.append("Would install systemd template anubis@.service")
+            else:
                 write_systemd_template(anubis_user, SYSTEMD_TEMPLATE, runner=runner)
                 daemon_reload(anubis_user, runner=runner)
+                result.steps.append("Installed systemd template anubis@.service")
         else:
             result.steps.append("Systemd template already installed")
 
@@ -244,9 +249,9 @@ def cmd_enable(
             enable_service(anubis_user, domain, runner=runner)
 
     if not prepare_only:
-        if dry_run and not cutover_only:
+        if dry_run:
             result.steps.append(f"Would cut over {domain} to proxy template (PROXYPORT={alloc.app_port})")
-        elif not dry_run:
+        else:
             if not certificate_exists(domain, runner=runner):
                 create_certificate(domain, runner=runner)
                 result.steps.append(f"Created Let's Encrypt certificate for {domain}")
@@ -272,7 +277,7 @@ def cmd_disable(
         result.error = f"Vhost {domain} not found"
         return result
 
-    if vh["template"] != "proxy_letsencrypt_https_redirect":
+    if vh["template"] != PROXY_TEMPLATE:
         result.error = f"{domain} is not behind Anubis (template is {vh['template']})"
         return result
 
@@ -286,7 +291,7 @@ def cmd_disable(
     is_last = len(vhosts_for_port) <= 1
 
     if dry_run:
-        result.steps.append(f"Switch {domain} back to {switch_to_default.__name__} template")
+        result.steps.append(f"Switch {domain} back to default_letsencrypt_https")
         if is_last:
             result.steps.append(f"This is the last vhost on port {port} — would tear down instance:")
             result.steps.append(f"  Stop + disable anubis@{domain}.service")
@@ -378,9 +383,23 @@ def cmd_upgrade(
                 result.warnings.append(
                     f"anubis@{inst.domain}.service is {state} after restart — stopping upgrade"
                 )
-                result.error = f"Health check failed for {inst.domain}"
+                result.error = f"Health check failed for {inst.domain} (service not active)"
                 return result
-            result.steps.append(f"  Health check: {state}")
+            try:
+                response = runner(
+                    f"curl -s -o /dev/null -w '%{{http_code}}' "
+                    f"-H 'X-Real-Ip: 127.0.0.1' -H 'Host: {inst.domain}' "
+                    f"http://localhost:{inst.port}/"
+                )
+                code = response.strip().strip("'")
+                if code and code[0] in "23":
+                    result.steps.append(f"  Health check: active (HTTP {code})")
+                else:
+                    result.warnings.append(f"anubis@{inst.domain}.service HTTP probe returned {code}")
+                    result.error = f"Health check failed for {inst.domain} (HTTP {code})"
+                    return result
+            except Exception:
+                result.steps.append(f"  Health check: active (service, HTTP probe skipped)")
 
     return result
 

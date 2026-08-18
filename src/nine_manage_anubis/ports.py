@@ -29,6 +29,7 @@ class AnubisInstance:
     user: str
     service_state: str
     vhosts: list[str] = field(default_factory=list)
+    version: str = ""
 
     @property
     def is_running(self) -> bool:
@@ -183,6 +184,11 @@ def _get_service_state(
     return result if result else "not-found"
 
 
+def _get_binary_version(user: str, runner: Runner) -> str:
+    result = nine_su(user, f"/home/{user}/bin/anubis --version 2>&1 || true", runner)
+    return result.strip()
+
+
 def discover_instances(
     runner: Runner = SubprocessRunner(),
 ) -> list[AnubisInstance]:
@@ -206,6 +212,7 @@ def discover_instances(
         metrics_port = port + 1
         state = _get_service_state(user, domain, runner)
         vhost_list = port_vhosts.get(port, [])
+        ver = _get_binary_version(user, runner)
         instances.append(
             AnubisInstance(
                 domain=domain,
@@ -214,6 +221,7 @@ def discover_instances(
                 user=user,
                 service_state=state,
                 vhosts=vhost_list,
+                version=ver,
             )
         )
     return instances

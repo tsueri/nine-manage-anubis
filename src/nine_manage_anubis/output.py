@@ -29,7 +29,7 @@ def _format_status_table(
     if not instances:
         return "No Anubis instances found."
 
-    headers = ["DOMAIN", "PORT", "METRICS", "USER", "STATE", "VHOSTS"]
+    headers = ["DOMAIN", "PORT", "METRICS", "USER", "STATE", "VERSION", "VHOSTS"]
     if health_map is not None:
         headers.append("HEALTH")
 
@@ -41,6 +41,7 @@ def _format_status_table(
             str(inst.metrics_port),
             inst.user,
             inst.service_state,
+            inst.version or "unknown",
             str(len(inst.vhosts)),
         ]
         if health_map is not None:
@@ -62,6 +63,7 @@ def _format_status_json(
             "metrics_port": inst.metrics_port,
             "user": inst.user,
             "state": inst.service_state,
+            "version": inst.version or "unknown",
             "vhosts": inst.vhosts,
             "vhost_count": len(inst.vhosts),
         }

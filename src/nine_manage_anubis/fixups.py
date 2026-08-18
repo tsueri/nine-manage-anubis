@@ -131,7 +131,7 @@ class FixupPlan:
 # --- Path helpers ------------------------------------------------------------
 
 
-def _p(webroot: str, name: str) -> str:
+def _webroot_path(webroot: str, name: str) -> str:
     return f"{webroot.rstrip('/')}/{name}"
 
 
@@ -140,10 +140,10 @@ def _p(webroot: str, name: str) -> str:
 
 def detect_state(webroot: str, ops: FileOps) -> FixupState:
     """Inspect the webroot and return its current fixup state."""
-    user_ini_path = _p(webroot, ".user.ini")
-    htaccess_path = _p(webroot, ".htaccess")
-    shim_path = _p(webroot, "anubis-origin-shim.php")
-    chain_path = _p(webroot, "anubis-prepend-chain.php")
+    user_ini_path = _webroot_path(webroot, ".user.ini")
+    htaccess_path = _webroot_path(webroot, ".htaccess")
+    shim_path = _webroot_path(webroot, "anubis-origin-shim.php")
+    chain_path = _webroot_path(webroot, "anubis-prepend-chain.php")
 
     user_ini_content = ops.read(user_ini_path)
     htaccess_content = ops.read(htaccess_path)
@@ -202,7 +202,7 @@ def plan(webroot: str, ops: FileOps) -> FixupPlan:
     state = detect_state(webroot, ops)
     p = FixupPlan(webroot=webroot, state=state)
 
-    shim_path = _p(webroot, "anubis-origin-shim.php")
+    shim_path = _webroot_path(webroot, "anubis-origin-shim.php")
 
     if not state.shim_present:
         p.steps.append("write anubis-origin-shim.php")
@@ -252,10 +252,10 @@ def apply(webroot: str, ops: FileOps, dry_run: bool = False) -> FixupPlan:
 
     _verify_safety()
 
-    shim_path = _p(webroot, "anubis-origin-shim.php")
-    user_ini_path = _p(webroot, ".user.ini")
-    htaccess_path = _p(webroot, ".htaccess")
-    chain_path = _p(webroot, "anubis-prepend-chain.php")
+    shim_path = _webroot_path(webroot, "anubis-origin-shim.php")
+    user_ini_path = _webroot_path(webroot, ".user.ini")
+    htaccess_path = _webroot_path(webroot, ".htaccess")
+    chain_path = _webroot_path(webroot, "anubis-prepend-chain.php")
 
     if any("anubis-origin-shim.php" in s for s in p.steps):
         ops.write(shim_path, SHIM_PHP)
@@ -314,10 +314,10 @@ def restore_plan(webroot: str, ops: FileOps) -> RestorePlan:
     state = detect_state(webroot, ops)
     rp = RestorePlan(webroot=webroot)
 
-    user_ini_path = _p(webroot, ".user.ini")
-    htaccess_path = _p(webroot, ".htaccess")
-    shim_path = _p(webroot, "anubis-origin-shim.php")
-    chain_path = _p(webroot, "anubis-prepend-chain.php")
+    user_ini_path = _webroot_path(webroot, ".user.ini")
+    htaccess_path = _webroot_path(webroot, ".htaccess")
+    shim_path = _webroot_path(webroot, "anubis-origin-shim.php")
+    chain_path = _webroot_path(webroot, "anubis-prepend-chain.php")
 
     if state.user_ini is not UserIniState.ABSENT:
         backups = ops.glob_backups(user_ini_path)
@@ -351,10 +351,10 @@ def restore(webroot: str, ops: FileOps, dry_run: bool = False) -> RestorePlan:
     if dry_run or not rp.steps:
         return rp
 
-    user_ini_path = _p(webroot, ".user.ini")
-    htaccess_path = _p(webroot, ".htaccess")
-    shim_path = _p(webroot, "anubis-origin-shim.php")
-    chain_path = _p(webroot, "anubis-prepend-chain.php")
+    user_ini_path = _webroot_path(webroot, ".user.ini")
+    htaccess_path = _webroot_path(webroot, ".htaccess")
+    shim_path = _webroot_path(webroot, "anubis-origin-shim.php")
+    chain_path = _webroot_path(webroot, "anubis-prepend-chain.php")
 
     if any("restore .user.ini from" in s for s in rp.steps):
         backups = ops.glob_backups(user_ini_path)

@@ -92,6 +92,7 @@ def _runner_with_data(**overrides) -> FakeRunner:
         _su_key("cat '/home/www-anubis/.config/anubis/example.ch.env'"): ENV_EXAMPLE,
         _su_key("cat '/home/www-anubis/.config/anubis/app.example.ch.env'"): ENV_DEMOVOX,
         _su_key("export XDG_RUNTIME_DIR"): "active",
+        _su_key("/home/www-anubis/bin/anubis --version"): "Anubis version 1.27.0\n",
     }
     responses.update(overrides)
     return FakeRunner(responses)

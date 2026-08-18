@@ -66,7 +66,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("disable", help="Remove Anubis protection from a vhost.")
     p.add_argument("domains", nargs="*", help="Domain(s) to disable.")
     p.add_argument("--all", action="store_true", help="Disable all Anubis vhosts for --user.")
-    p.add_argument("--user", help="Anubis user to filter --all by.")
+    p.add_argument("--user", help="Website user to filter --all by.")
 
     # upgrade
     p = sub.add_parser("upgrade", help="Download new Anubis binary and restart instances.")

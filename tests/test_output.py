@@ -10,7 +10,7 @@ from nine_manage_anubis.output import (
 from nine_manage_anubis.ports import AnubisInstance
 
 
-def _instance(domain="test.com", port=7010, state="active", vhosts=None):
+def _instance(domain="test.com", port=7010, state="active", vhosts=None, version="1.27.0"):
     return AnubisInstance(
         domain=domain,
         port=port,
@@ -18,6 +18,7 @@ def _instance(domain="test.com", port=7010, state="active", vhosts=None):
         user="www-anubis",
         service_state=state,
         vhosts=vhosts or [domain],
+        version=version,
     )
 
 
@@ -32,6 +33,8 @@ def test_status_table_basic():
     assert "b.com" in out
     assert "7010" in out
     assert "7012" in out
+    assert "VERSION" in out
+    assert "1.27.0" in out
 
 
 def test_status_table_empty():
@@ -64,6 +67,7 @@ def test_status_json_basic():
     assert data[0]["domain"] == "a.com"
     assert data[0]["port"] == 7010
     assert data[0]["vhost_count"] == 1
+    assert data[0]["version"] == "1.27.0"
 
 
 def test_status_json_with_health():

@@ -43,6 +43,7 @@ def _base_runner(**overrides) -> FakeRunner:
         _SU + "ls ~/.config/anubis/*.env 2>/dev/null": "/home/www-anubis/.config/anubis/test.example.ch.env\n",
         _SU + "cat '/home/www-anubis/.config/anubis/test.example.ch.env'": "BIND=:7010\nMETRICS_BIND=:7011\nTARGET_HOST=origin-test.example.ch\n",
         _SU + "export XDG_RUNTIME_DIR": "active",
+        _SU + "/home/www-anubis/bin/anubis --version": "Anubis version 1.27.0\n",
         _SU + "test -f": "yes\n",
         _SU + "cat >": "",
         _SU + "rm -f": "",
@@ -58,6 +59,7 @@ def _base_runner(**overrides) -> FakeRunner:
         "sudo nine-manage-vhosts user remove": "",
         "curl -sL https://api.github.com/repos/TecharoHQ/anubis/releases/latest "
         "| grep -m1 '\"tag_name\"'": '"tag_name": "v1.27.0"',
+        "curl -s -o /dev/null -w '%{http_code}'": "200",
     }
     responses.update(overrides)
     return FakeRunner(responses)
