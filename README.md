@@ -145,10 +145,10 @@ nine-manage-anubis enable site1.ch site2.ch
 nine-manage-anubis enable --all --user www-example
 
 # Prepare only (no cutover) — safe for production
-nine-manage-anubis enable --all --user www-example --prepare-only
+nine-manage-anubis enable --all --user www-example --prepare-only --no-notify-services
 
 # Cutover later (after PHP-FPM .user.ini cache expires, ~5 min)
-nine-manage-anubis enable --all --user www-example --cutover-only
+nine-manage-anubis enable --all --user www-example --cutover-only --no-notify-services --skip "vorlage*"
 
 # Dry run — see what would happen
 nine-manage-anubis --dry-run enable example.com
@@ -384,15 +384,15 @@ PHP-FPM caches `.user.ini` for 300 seconds. If you prepare and cutover in one st
 # Step 1: Prepare everything except the cutover
 # Creates key, env, fixups, origin vhost, starts Anubis service.
 # Public vhost still serves directly — no traffic impact.
-nine-manage-anubis enable --all --user www-example --prepare-only
+nine-manage-anubis enable --all --user www-example --prepare-only --no-notify-services
 
 # Step 2: Wait 5 minutes for PHP-FPM to pick up the .user.ini shim.
 # You can verify the shim is loaded during this window:
 #   curl -sA Googlebot https://example.com/ | grep -ioE '<title>[^<]*</title>'
 # (should show the site title, not a redirect to wp-signup.php?new=origin-*)
 
-# Step 3: Cut over all domains (brief Apache reload per domain)
-nine-manage-anubis enable --all --user www-example --cutover-only
+# Step 3: Cut over all domains (single Apache reload at end of batch)
+nine-manage-anubis enable --all --user www-example --cutover-only --no-notify-services --skip "vorlage*"
 
 # Step 4: Verify
 nine-manage-anubis self-test

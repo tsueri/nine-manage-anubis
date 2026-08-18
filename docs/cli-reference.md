@@ -321,16 +321,16 @@ nine-manage-anubis enable site1.ch site2.ch site3.ch
 nine-manage-anubis enable --all --user www-example
 
 # Prepare only — no cutover, no traffic impact
-nine-manage-anubis enable --all --user www-example --prepare-only
+nine-manage-anubis enable --all --user www-example --prepare-only --no-notify-services
 
 # Cutover later (after PHP-FPM .user.ini cache expires, ~5 min)
-nine-manage-anubis enable --all --user www-example --cutover-only
+nine-manage-anubis enable --all --user www-example --cutover-only --no-notify-services --skip "vorlage*"
 
 # Dry run — see every step without changes
 nine-manage-anubis --dry-run enable example.com
 
 # Dry run for batch
-nine-manage-anubis --dry-run enable --all --user www-example --prepare-only
+nine-manage-anubis --dry-run enable --all --user www-example --prepare-only --no-notify-services
 ```
 
 #### Errors
@@ -896,14 +896,14 @@ nine-manage-anubis status                   # all three on one instance
 nine-manage-anubis --dry-run enable --all --user www-example
 
 # 2. Prepare (no traffic impact)
-nine-manage-anubis enable --all --user www-example --prepare-only
+nine-manage-anubis enable --all --user www-example --prepare-only --no-notify-services
 
 # 3. Wait 5 minutes for PHP-FPM .user.ini cache to expire
 #    Verify the shim is loaded:
 #    curl -sA Googlebot https://<domain>/ | grep -ioE '<title>[^<]*</title>'
 
-# 4. Cut over
-nine-manage-anubis enable --all --user www-example --cutover-only
+# 4. Cut over (single Apache reload at end of batch)
+nine-manage-anubis enable --all --user www-example --cutover-only --no-notify-services --skip "vorlage*"
 
 # 5. Verify
 nine-manage-anubis self-test
