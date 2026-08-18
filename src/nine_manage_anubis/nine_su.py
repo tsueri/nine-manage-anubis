@@ -40,10 +40,15 @@ def nine_su_read_file(user: str, path: str, runner: Runner) -> str | None:
 
 
 def nine_su_write_file(user: str, path: str, content: str, runner: Runner) -> None:
-    """Write a file as another user. Creates parent dirs if needed."""
+    """Write a file as another user. Creates parent dirs if needed.
+
+    Handles read-only files (e.g. .htaccess at 444) by temporarily
+    granting write permission before the redirect.
+    """
     inner_marker = "FILE_EOF"
     script = (
         f"mkdir -p '$(dirname \"{path}\")'\n"
+        f"chmod u+w '{path}' 2>/dev/null || true\n"
         f"cat > '{path}' <<'{inner_marker}'\n"
         f"{content}\n"
         f"{inner_marker}"
