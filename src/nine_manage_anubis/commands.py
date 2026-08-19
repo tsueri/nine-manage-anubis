@@ -7,6 +7,7 @@ Each takes an injectable Runner and returns a list of step strings
 
 from __future__ import annotations
 
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
@@ -88,6 +89,21 @@ ANUBIS_VERSION = Settings.anubis_version
 # probe runs locally and unprivileged, so the runner's own kill lands, and the
 # failure then reads as a timeout rather than as curl exit code 28.
 PROBE_TIMEOUT = 10.0
+
+# The health check that follows a restart cannot judge the instance the moment
+# the restart returns: a Type=simple unit has systemctl come back as soon as
+# the process spawns, while the port its env file asks for opens a beat later.
+# Probe that gap and a rolling restart aborts on an instance that only had to
+# read its config. A just-restarted instance gets this long to answer before
+# it is allowed to fail, checking again every interval; the retries are
+# bounded (below) so a genuinely down instance still stops the rollout.
+STARTUP_GRACE = 10.0
+STARTUP_RETRY_INTERVAL = 1.0
+
+# How many times the health check retries an instance that is not up yet over
+# the startup grace. Derived from the two constants so the bound and the
+# window cannot disagree.
+STARTUP_ATTEMPTS = max(1, int(STARTUP_GRACE / STARTUP_RETRY_INTERVAL))
 
 
 def _validate_inputs(
@@ -255,6 +271,45 @@ def _health_verdict(
     return HealthVerdict(True, answer)
 
 
+# The verdicts that mean "not up yet" rather than "sick": the unit still
+# leaving ``activating``, or nothing listening on its port yet. Both are what
+# a freshly restarted process looks like for a moment, so both are worth
+# another look within the startup grace. Anything else is an answer, and
+# answers are judged as they arrive.
+_STARTING_UP_REASONS = {"service not active", PROBE_FAILED}
+
+
+def _wait_until_healthy(
+    anubis_user: str,
+    inst: AnubisInstance,
+    runner: Runner,
+    sleep: Callable[[float], None] = time.sleep,
+) -> HealthVerdict:
+    """The health check for an instance that was just restarted.
+
+    ``systemctl restart`` on a ``Type=simple`` unit returns the moment the
+    process spawns, so the first probe can find its port still closed on an
+    instance that binds a beat later. Such a check is retried within the
+    startup grace rather than trusted to decide a rolling restart; a probe
+    that *answers* — a status code, or one that hangs — is final as it
+    stands. An instance still down when the grace runs out is reported as
+    the last thing it said, so the message names the real refusal.
+    """
+    attempts = 0
+    while True:
+        verdict = _health_verdict(anubis_user, inst, runner)
+        if verdict.ok or verdict.reason not in _STARTING_UP_REASONS:
+            return verdict
+        attempts += 1
+        if attempts >= STARTUP_ATTEMPTS:
+            return HealthVerdict(
+                False,
+                f"{verdict.detail} — still starting after {STARTUP_GRACE:g}s",
+                verdict.reason,
+            )
+        sleep(STARTUP_RETRY_INTERVAL)
+
+
 def _restart_one(
     anubis_user: str, inst: AnubisInstance, runner: Runner, result: CommandResult
 ) -> None:
@@ -268,11 +323,12 @@ def _rolling_restart(
     instances: list[AnubisInstance],
     runner: Runner,
     result: CommandResult,
+    sleep: Callable[[float], None] = time.sleep,
 ) -> None:
     """Restart each instance, stopping at the first that fails its check."""
     for inst in instances:
         _restart_one(anubis_user, inst, runner, result)
-        verdict = _health_verdict(anubis_user, inst, runner)
+        verdict = _wait_until_healthy(anubis_user, inst, runner, sleep=sleep)
         if not verdict.ok:
             result.warnings.append(
                 f"anubis@{inst.domain}.service {verdict.detail} — stopping"
@@ -931,6 +987,7 @@ def cmd_upgrade(
     dry_run: bool = False,
     no_rolling: bool = False,
     anubis_user: str = DEFAULT_ANUBIS_USER,
+    sleep: Callable[[float], None] = time.sleep,
 ) -> CommandResult:
     _validate_inputs(anubis_user, version=version)
 
@@ -964,7 +1021,7 @@ def cmd_upgrade(
     if no_rolling:
         _restart_all_at_once(anubis_user, instances, runner, result)
     else:
-        _rolling_restart(anubis_user, instances, runner, result)
+        _rolling_restart(anubis_user, instances, runner, result, sleep=sleep)
 
     return result
 
@@ -1085,6 +1142,7 @@ def cmd_restart(
     dry_run: bool = False,
     no_rolling: bool = False,
     anubis_user: str = DEFAULT_ANUBIS_USER,
+    sleep: Callable[[float], None] = time.sleep,
 ) -> CommandResult:
     _validate_inputs(anubis_user)
 
@@ -1108,6 +1166,6 @@ def cmd_restart(
     if no_rolling:
         _restart_all_at_once(anubis_user, instances, runner, result)
     else:
-        _rolling_restart(anubis_user, instances, runner, result)
+        _rolling_restart(anubis_user, instances, runner, result, sleep=sleep)
 
     return result

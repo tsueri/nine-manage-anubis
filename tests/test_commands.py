@@ -24,6 +24,7 @@ from nine_manage_anubis.commands import (
     DEFAULT_ANUBIS_USER,
     PROBE_FAILED,
     PROBE_TIMEOUT,
+    STARTUP_ATTEMPTS,
 )
 
 _SU = "sudo nine-su www-anubis <<'NINE_SU_EOF'\n"
@@ -1018,7 +1019,7 @@ def _refusing_runner() -> _ProbeFails:
 @pytest.mark.parametrize("command", [cmd_restart, cmd_upgrade])
 def test_a_rolling_restart_stops_when_the_probe_could_not_be_made(command):
     r = _refusing_runner()
-    result = command(runner=r)
+    result = command(runner=r, sleep=_no_sleep)
     assert not result.success
     assert "test.example.ch" in result.error
     assert "skipped" not in " ".join(result.steps).lower()
@@ -1038,10 +1039,72 @@ def test_a_rolling_restart_that_stops_does_not_restart_the_next_instance(command
         _SU + "cat -- /home/www-anubis/.config/anubis/second.example.ch.env":
             "BIND=:7012\nMETRICS_BIND=:7013\n",
     }).responses)
-    result = command(runner=r)
+    result = command(runner=r, sleep=_no_sleep)
     assert not result.success
     restarts = [c for c in r.calls if "restart anubis@" in c]
     assert len(restarts) == 1, restarts
+
+
+# --- A just-restarted instance can be slow to come up -------------------------
+#
+# `systemctl restart` on a Type=simple unit returns as soon as the process
+# spawns, at which point its port may still be closed. The health check that
+# follows a restart therefore retries the "not yet" verdicts for a bounded
+# grace period — an instance that answers within it is healthy; one that does
+# not is a failure like any other.
+
+
+def _no_sleep(_seconds: float) -> None:
+    """Tests do not wait for real time; a restart's grace lets them not."""
+
+
+class _SlowToBind(FakeRunner):
+    """Everything answers as usual, but the probe refuses its first
+    ``refusals`` times — the instance that is still binding its port."""
+
+    def __init__(self, refusals: int, responses: dict[str, str]) -> None:
+        super().__init__(responses)
+        self.refusals = refusals
+        self.probes = 0
+
+    def __call__(self, cmd, **kwargs):
+        if cmd.startswith("curl -s -o /dev/null"):
+            self.probes += 1
+            if self.probes <= self.refusals:
+                raise CommandFailed("curl", 7, "Failed to connect to localhost port 7010")
+        return super().__call__(cmd, **kwargs)
+
+
+@pytest.mark.parametrize("command", [cmd_restart, cmd_upgrade])
+def test_a_rolling_restart_waits_for_an_instance_that_is_slow_to_bind(command):
+    """Probes are retried while the instance is still coming up, not failed."""
+    r = _SlowToBind(refusals=2, responses=_base_runner().responses)
+    result = command(runner=r, sleep=_no_sleep)
+    assert result.success, result.error
+    assert r.probes == 3
+
+
+@pytest.mark.parametrize("command", [cmd_restart, cmd_upgrade])
+def test_a_rolling_restart_gives_an_instance_the_whole_grace_to_come_up(command):
+    """The grace is inclusive: binding on the last try is still healthy."""
+    r = _SlowToBind(
+        refusals=STARTUP_ATTEMPTS - 1, responses=_base_runner().responses
+    )
+    result = command(runner=r, sleep=_no_sleep)
+    assert result.success, result.error
+    assert r.probes == STARTUP_ATTEMPTS
+
+
+@pytest.mark.parametrize("command", [cmd_restart, cmd_upgrade])
+def test_a_rolling_restart_gives_up_once_the_grace_is_spent(command):
+    """An instance still down after the grace is a failure, retries bounded."""
+    r = _SlowToBind(
+        refusals=STARTUP_ATTEMPTS + 1, responses=_base_runner().responses
+    )
+    result = command(runner=r, sleep=_no_sleep)
+    assert not result.success
+    assert "test.example.ch" in result.error
+    assert r.probes == STARTUP_ATTEMPTS
 
 
 def test_selftest_reports_a_probe_that_could_not_be_made():
@@ -1144,7 +1207,7 @@ def test_disable_says_not_behind_anubis_before_it_says_anything_else():
 
 def test_one_wording_for_a_probe_that_could_not_be_made():
     """A rolling restart and `status` must not name the same thing differently."""
-    result = cmd_restart(runner=_refusing_runner())
+    result = cmd_restart(runner=_refusing_runner(), sleep=_no_sleep)
     _, health_map = cmd_status(health=True, runner=_refusing_runner())
     assert health_map is not None
     assert PROBE_FAILED in result.error
