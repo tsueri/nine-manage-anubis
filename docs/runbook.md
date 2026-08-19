@@ -682,6 +682,121 @@ The Anubis binary, systemd template, and Anubis user remain — they're shared a
 - **WARN log about `REDIRECT_DOMAINS` not set** — expected. Anubis warns at startup if `REDIRECT_DOMAINS` is unset (it will accept redirects to any domain). For a single-domain setup this is harmless; set it to lock down which domains Anubis will redirect to (e.g., `REDIRECT_DOMAINS=example.com,www.example.com`).
 - **Domain is behind Cloudflare or another CDN** — fine. The CDN proxies to the nine server, which proxies to Anubis. Anubis sees the CDN's IP as `X-Real-Ip` (set by the public vhost). The CDN may also do its own bot filtering — both layers operate independently. If you see a "Just a moment..." page instead of Anubis's challenge, that's Cloudflare's challenge, not Anubis's.
 - **WordPress behind Anubis** — WordPress works behind Anubis with the origin fixups in place. The shim restores `HTTP_HOST` so WordPress, Yoast SEO, and other plugins generate correct canonical URLs. If URLs in the HTML point to `origin-<domain>` instead of the public domain, the shim isn't loaded — check `.user.ini`. If Wordfence WAF is installed, its `auto_prepend_file` must be chained (see "Migrating an existing domain" step 8).
+- **Link previews show no image/title (Open Graph passthrough produces nothing)** — see "Open Graph passthrough" below. Upstream Anubis ≤ 1.27.0 does not send `X-Forwarded-Host` on its OG fetch, so the origin cannot tell which site to serve.
+- **Redirect-only vhost returns 403 after cutover** — the vhost's only job is a 301/302 to another domain (e.g. a campaign domain pointing at `www.example.ch/campaign/...`), via a `RewriteCond %{HTTP_HOST}` in `.htaccess`. Behind the origin dance Apache sees `Host: origin-<domain>`, the condition never matches, the rule never fires, and the empty webroot yields 403 (`AH01276` in the origin vhost's error log). The shim can't help: `mod_rewrite` runs before PHP. Key the rule on `X-Forwarded-Host` instead (set by the public proxy vhost, passed through by Anubis — same guard as the fixup block, so it stays a no-op without Anubis):
+
+  ```apache
+  RewriteEngine On
+  RewriteCond %{HTTP:X-Forwarded-Host} ^(www\.)?example\.ch$ [NC]
+  RewriteCond %{REQUEST_URI} !\.well-known/acme-challenge
+  RewriteRule ^(.*)$ https://www.target.ch/some/path? [R=301,L]
+  ```
+
+  Better still, consider not protecting such vhosts at all: a redirect costs nothing to serve, and the real traffic is challenged at the target domain if it is protected there.
+
+## Open Graph passthrough
+
+`openGraph.enabled: true` makes Anubis fetch the target page and copy its
+`og:*` / `twitter:*` / `description` tags into the challenge page, so a link
+still unfurls even when the crawler is challenged.
+
+### Upstream bug: the OG fetch omits `X-Forwarded-Host`
+
+Anubis' OG fetcher (`internal/ogtags/fetch.go`) builds a **fresh** request rather
+than forwarding the visitor's. It sets only `Host` (from `TARGET_HOST`),
+`X-Forwarded-Proto` and `User-Agent: Anubis-OGTag-Fetcher/1.0`.
+
+That breaks the origin dance. On the normal proxy path the public vhost sets
+`X-Forwarded-Host`, Anubis passes it through, and `anubis-origin-shim.php`
+restores `HTTP_HOST` from it. On the OG path that header is absent, so the origin
+sees `Host: origin-<domain>`, WordPress multisite doesn't recognise the site, and
+the fetch is redirected to `wp-signup.php?new=origin-<domain>`. Go's HTTP client
+then follows that redirect out to the public hostname while the transport still
+pins SNI to `origin-<domain>`, so nginx answers **421 Misdirected Request**.
+Anubis treats the non-200 as "no tags", caches an **empty** map for the full
+`ttl` (24h), and renders the challenge page with no OG tags at all. It fails
+silently — nothing is logged above debug level.
+
+Symptom in the logs (`/home/<user>/logs/origin-<domain>.access.log`):
+
+```
+"GET /some/article/ HTTP/2.0" 302 107 "-" "Anubis-OGTag-Fetcher/1.0"
+"GET /wp-signup.php?new=origin-herisau HTTP/2.0" 421 403 "https://127.0.0.1:443/some/article/" "Anubis-OGTag-Fetcher/1.0"
+```
+
+Confirm the diagnosis by adding the header by hand — this should return 200 with
+the tags present:
+
+```bash
+curl -k --resolve 'origin-<domain>:443:127.0.0.1' \
+     -H 'X-Forwarded-Host: <public-domain>' \
+     -A 'Anubis-OGTag-Fetcher/1.0' \
+     'https://origin-<domain>/<path>'
+```
+
+### Fix: patched binary `1.27.0-xfh1`
+
+The deployed binary is a local build of v1.27.0 with three added lines in
+`internal/ogtags/fetch.go`:
+
+```go
+if originalHost != "" {
+    req.Header.Set("X-Forwarded-Host", originalHost)
+}
+```
+
+Version string is `1.27.0-xfh1` so `nine-manage-anubis status` shows plainly that
+this is not a stock release. The stock binary is kept for rollback:
+
+```bash
+sudo nine-su www-anubis
+ls -la ~/bin/anubis ~/bin/anubis.stock-1.27.0   # rollback: mv anubis.stock-1.27.0 anubis
+```
+
+> **Trap: `nine-manage-anubis upgrade` silently reverts this fix.** `cmd_upgrade`
+> downloads the release tarball unconditionally — it does not compare versions —
+> so it overwrites `~/bin/anubis` with the stock build and OG passthrough breaks
+> again with no error. After any `upgrade`, re-deploy the patched binary (or
+> confirm the fix has landed upstream and use the release).
+
+Replace the binary with a staged `mv`, never `cp` in place — `cp` writes through
+the same inode and can crash the ~170 running instances:
+
+```bash
+cp /tmp/anubis-<ver> ~/bin/anubis.new && chmod 755 ~/bin/anubis.new
+~/bin/anubis.new --version
+mv -f ~/bin/anubis.new ~/bin/anubis   # atomic; running procs keep the old inode
+```
+
+### Secondary: which crawlers get challenged at all
+
+Weight, not OG passthrough, decides whether a crawler ever sees a challenge. The
+`generic-browser` rule adds **+10** for any UA matching `Mozilla|Opera`:
+
+- UA **without** "Mozilla" (`facebookexternalhit`, `Twitterbot`, `WhatsApp`, `TelegramBot`) → weight 0 → `minimal-suspicion` → ALLOW → real page, real tags. Works by accident.
+- UA **with** "Mozilla" (`Discordbot`, `Mastodon`, `LinkedInBot`) → +10 → `moderate-suspicion` → CHALLENGE → depends on OG passthrough working.
+
+The shared policy therefore also carries an explicit `link-preview-crawlers`
+ALLOW rule so unfurlers get the real HTML instead of a challenge page. It is
+placed **after** the deny imports, so a spoofed UA still has to pass
+`_deny-pathological` and `ai-block-moderate`. It matches on user agent only and
+is therefore spoofable — acceptable because non-"Mozilla" UAs already reached
+weight 0, but note that upstream's own `data/clients/telegram-preview.yaml`
+pairs the UA match with `verifyFCrDNS()`, which is the robust form.
+
+### Reading the OG fetcher's success rate
+
+Most OG fetches are triggered by scanner traffic against paths that don't exist,
+so a low 200-rate is normal and not itself a fault. Judge the fix on real content
+URLs, and expect legitimate non-200s from alias domains that 301 to a canonical
+host (a redirect carries no tags; the crawler follows it and gets tags at the
+destination).
+
+```bash
+# status codes for OG fetches across all vhost logs
+grep -h 'Anubis-OGTag-Fetcher' /home/*/logs/*.access.log \
+  | sed -E 's/.*" ([0-9]{3}) .*/\1/' | sort | uniq -c | sort -rn
+```
 
 ## References
 
