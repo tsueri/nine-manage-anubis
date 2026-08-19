@@ -11,8 +11,11 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 
+from .locking import DEFAULT_TIMEOUT, ExclusiveLock
 from .runner import Runner, SubprocessRunner
 from .nine_su import nine_su, nine_su_read_file
 from .shell import quote
@@ -31,6 +34,12 @@ from .validate import (
 )
 
 PAIR_STRIDE = 2
+
+# The file whose lock says "a run is between reading the ports in use and
+# writing down the one it took". See :mod:`~nine_manage_anubis.locking` for
+# why it is there and not in /tmp.
+PORT_LOCK_PATH = "/run/lock/nine-manage-anubis-ports.lock"
+PORT_LOCK_TIMEOUT = DEFAULT_TIMEOUT
 
 
 @dataclass
@@ -57,6 +66,34 @@ class PortAllocation:
     @property
     def is_reused(self) -> bool:
         return self.reused_from is not None
+
+
+class PortClaim:
+    """Ports a run may use, and — while they are fresh — its hold on them.
+
+    Separate from :class:`PortAllocation` because the two have different
+    lifetimes: the allocation is a value the rest of an ``enable`` reads for as
+    long as it runs, the hold ends the moment the env file makes the decision
+    everyone else's business.
+    """
+
+    def __init__(self, ports: PortAllocation, release: Callable[[], None]) -> None:
+        self.ports = ports
+        self._release = release
+
+    def release(self) -> None:
+        """Let go of the hold on these ports.
+
+        Call it the moment the env file records the pair: from then on every
+        other run's scan finds the port taken, so there is nothing left for
+        exclusion to protect — and a good deal of an ``enable`` still to come,
+        a certificate request among it, that would be a poor thing to keep the
+        rest of the host waiting behind. Call it just as readily when it
+        becomes clear nothing will be recorded at all, as in a dry run.
+
+        Forgetting is safe and merely slow: the block's exit releases anyway.
+        """
+        self._release()
 
 
 # --- Vhost discovery ----------------------------------------------------------
@@ -127,13 +164,26 @@ def get_vhost(domain: str, runner: Runner = SubprocessRunner()) -> dict | None:
 
 
 def _parse_ss_output(ss_output: str) -> set[int]:
-    ports = set()
+    """The ports in the allocation range something is listening on.
+
+    A port is a whole run of digits after a colon at the end of an address,
+    and what makes it ours is the range check below — not how long it is. The
+    scan used to match exactly four digits, which is the shape of every port
+    in *today's* range: a run of five would match nothing at all rather than
+    fall outside the range, so the scan would have gone silently blind the day
+    the range moved, and handed out ports already in use.
+
+    The address has to *end* there, which is what keeps an IPv6 address out of
+    it: the hextets of ``[2a01:4f8::7010]:443`` are digits after colons too,
+    and reading one as a port would retire a perfectly free pair.
+    """
+    found = set()
     for line in ss_output.strip().splitlines():
-        for match in re.finditer(r":(\d{4})\b", line):
+        for match in re.finditer(r":(\d+)(?=\s|$)", line):
             port = int(match.group(1))
             if PORT_RANGE_START <= port <= PORT_RANGE_END:
-                ports.add(port)
-    return ports
+                found.add(port)
+    return found
 
 
 def get_listening_ports(runner: Runner = SubprocessRunner()) -> set[int]:
@@ -295,11 +345,31 @@ def _all_used_ports(runner: Runner) -> set[int]:
 
 
 def next_free_pair(runner: Runner = SubprocessRunner()) -> tuple[int, int]:
+    """The lowest free pair, checked once more before it is handed out.
+
+    Reading what is in use is not one question but three — listening sockets,
+    env files, vhost variables — so by the time the walk has an answer, the
+    first part of it is several round trips old. Under the allocation lock the
+    env files and the vhosts cannot have moved: no other run of this tool is
+    between its own read and its own claim. What can have moved is the box
+    itself, some unrelated process having bound a port since we looked, and
+    that is the one this re-reads before committing to a pair.
+
+    A pair that fails the re-check is not the end of the walk: the fresh
+    listing folds into the used set and the walk carries on, so an exhausted
+    range still ends in the error below rather than in a pair nobody can bind.
+    Folding it in is also what keeps the cost down — every candidate the fresh
+    listing rules out is ruled out without a second look, so re-reading twice
+    takes a port having been bound between the two reads, not a long walk.
+    """
     used = _all_used_ports(runner)
     port = PORT_RANGE_START
     while port <= PORT_RANGE_END - 1:
         if port not in used and (port + 1) not in used:
-            return (port, port + 1)
+            listening = get_listening_ports(runner)
+            if port not in listening and (port + 1) not in listening:
+                return (port, port + 1)
+            used |= listening
         port += PAIR_STRIDE
     raise RuntimeError(f"No free port pair in range {PORT_RANGE_START}-{PORT_RANGE_END}")
 
@@ -346,13 +416,18 @@ def find_prepared_port_for_webroot(
     return None
 
 
-def allocate_for_domain(
-    domain: str, runner: Runner = SubprocessRunner()
-) -> PortAllocation:
-    vh = get_vhost(domain, runner)
-    if vh is None:
-        raise ValueError(f"Vhost {domain} not found")
+def _existing_for_domain(
+    domain: str, vh: dict, runner: Runner
+) -> PortAllocation | None:
+    """The ports ``domain`` is already entitled to, if any.
 
+    Three ways a domain can have ports without any being allocated: a sibling
+    on the same webroot is already behind Anubis, a sibling was prepared but
+    not yet cut over, or this domain itself was prepared earlier. All three are
+    a *read* of a decision somebody already made and recorded — nothing new is
+    taken from the range — which is why they can be answered and then let go
+    of, while a fresh pair has to be held.
+    """
     webroot = vh.get("webroot", "")
     if webroot:
         # 1. A proxy vhost sharing this webroot is already behind Anubis.
@@ -391,6 +466,47 @@ def allocate_for_domain(
             metrics_port=existing_port + 1,
         )
 
-    # 4. Nothing exists yet — allocate a fresh pair.
-    app, metrics = next_free_pair(runner)
-    return PortAllocation(app_port=app, metrics_port=metrics)
+    return None
+
+
+@contextmanager
+def claim_for_domain(
+    domain: str, runner: Runner = SubprocessRunner()
+) -> Iterator[PortClaim]:
+    """The ports ``domain`` is to use, decided where no other run can interfere.
+
+    Everything between reading what is in use and recording the answer happens
+    under the host-wide lock, because every part of the sequence is a read the
+    next run's decision depends on. Two runs that skip the lock don't merely
+    pick the same free pair: one prepares a second instance for a webroot the
+    other is already preparing one for, and that orphan outlives both runs.
+
+    A decision that takes nothing — a reused instance, a port this domain was
+    already prepared with — lets the lock go before the block even starts.
+    A fresh pair is held until the caller calls :meth:`PortClaim.release`,
+    which it should do as soon as the env file records the pair, and which the
+    block's exit does for it either way.
+    """
+    # Before the lock, not after: a domain that is about to be rejected has no
+    # business making every other run on the host wait for it.
+    validate_domain(domain)
+    with ExclusiveLock(
+        PORT_LOCK_PATH,
+        what="allocating an Anubis port pair",
+        runner=runner,
+        timeout=PORT_LOCK_TIMEOUT,
+    ) as lock:
+        vh = get_vhost(domain, runner)
+        if vh is None:
+            raise ValueError(f"Vhost {domain} not found")
+
+        existing = _existing_for_domain(domain, vh, runner)
+        if existing is not None:
+            lock.release()
+            yield PortClaim(existing, lock.release)
+            return
+
+        app, metrics = next_free_pair(runner)
+        yield PortClaim(
+            PortAllocation(app_port=app, metrics_port=metrics), lock.release
+        )

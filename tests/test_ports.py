@@ -5,13 +5,19 @@ are now heredoc-based (sudo nine-su <user> <<'EOF' ... EOF) instead of
 the broken -c pattern.
 """
 
+import threading
+import time
+
 import pytest
 from shellparse import argv, script_argv
 
+from nine_manage_anubis import ports
+from nine_manage_anubis.locking import LockUnavailable
 from nine_manage_anubis.runner import FakeRunner
 from nine_manage_anubis.validate import ValidationError
 from nine_manage_anubis.ports import (
     AnubisInstance,
+    PAIR_STRIDE,
     PortAllocation,
     PORT_RANGE_START,
     PORT_RANGE_END,
@@ -30,7 +36,7 @@ from nine_manage_anubis.ports import (
     discover_instances,
     _all_used_ports,
     next_free_pair,
-    allocate_for_domain,
+    claim_for_domain,
     find_port_for_domain,
     find_prepared_port_for_webroot,
 )
@@ -180,8 +186,42 @@ def test_parse_ss_output():
 
 def test_get_listening_ports():
     r = FakeRunner({"ss -tlnp": SS_OUTPUT})
-    ports = get_listening_ports(r)
-    assert ports == {7010, 7011, 7012, 7013, 7014, 7015}
+    listening = get_listening_ports(r)
+    assert listening == {7010, 7011, 7012, 7013, 7014, 7015}
+
+
+def test_parse_ss_output_ignores_ports_outside_the_range_whatever_their_length():
+    """Only the range decides what counts, and it is checked as a number.
+
+    A port of some other length used to be invisible rather than
+    out-of-range — the same answer here, but for a reason that survives the
+    range being moved."""
+    out = (
+        'LISTEN 0 4096 0.0.0.0:443 0.0.0.0:* users:(("apache2",pid=1,fd=3))\n'
+        'LISTEN 0 4096 0.0.0.0:45678 0.0.0.0:* users:(("node",pid=2,fd=3))\n'
+    )
+    assert _parse_ss_output(out) == set()
+
+
+def test_parse_ss_output_does_not_read_an_ipv6_hextet_as_a_port():
+    """An IPv6 address is full of digits after colons, and none of them are
+    the port — reading one as taken retires a pair nothing is using."""
+    out = (
+        'LISTEN 0 4096 [2a01:4f8::7010]:443 [::]:* users:(("apache2",pid=1,fd=3))\n'
+    )
+    assert _parse_ss_output(out) == set()
+
+
+def test_parse_ss_output_recognises_an_in_range_port_of_any_length(monkeypatch):
+    """The allocation range is two numbers, not a digit count.
+
+    The scan used to match exactly four digits, which happens to be the shape
+    of every port in today's range — so moving the range would have left the
+    scan silently seeing nothing and allocating ports already in use."""
+    monkeypatch.setattr(ports, "PORT_RANGE_START", 17010)
+    monkeypatch.setattr(ports, "PORT_RANGE_END", 17999)
+    out = 'LISTEN 0 4096 0.0.0.0:17010 0.0.0.0:* users:(("anubis",pid=1,fd=3))\n'
+    assert _parse_ss_output(out) == {17010}
 
 
 # --- Env file parsing tests ---------------------------------------------------
@@ -285,6 +325,75 @@ def test_next_free_pair_with_existing():
     assert metrics == 7017
 
 
+class _SomethingStartsListeningMidScan(FakeRunner):
+    """A host where a port is bound after the walk has read the used set.
+
+    Reading what is in use takes several round trips — listening sockets, then
+    env files, then vhosts — so the answer the walk decides from is already a
+    little old by the time it has one. Only the first `ss` sees the old host."""
+
+    def __init__(self, responses: dict[str, str], later_ss: str):
+        super().__init__(responses)
+        self._later_ss = later_ss
+
+    def __call__(self, cmd, **kwargs):
+        out = super().__call__(cmd, **kwargs)
+        if cmd.startswith("ss -tlnp"):
+            self.responses["ss -tlnp"] = self._later_ss
+        return out
+
+
+def _listening(*ports: int) -> str:
+    return "".join(
+        f'LISTEN 0 4096 0.0.0.0:{p} 0.0.0.0:* users:(("x",pid=1,fd=3))\n'
+        for p in ports
+    )
+
+
+def test_next_free_pair_rechecks_the_pair_before_handing_it_out():
+    r = _SomethingStartsListeningMidScan(
+        {
+            "sudo nine-manage-vhosts virtual-host list --json": "[]",
+            "ss -tlnp": "",
+            "ls -d /home/www-*/ 2>/dev/null": "",
+        },
+        later_ss=_listening(7010, 7011),
+    )
+    assert next_free_pair(r) == (7012, 7013)
+
+
+def test_next_free_pair_still_reports_exhaustion_when_the_recheck_keeps_failing():
+    """The re-check must not be able to swallow the walk's ending.
+
+    Here nothing looks used until the pair is re-checked, at which point the
+    whole range turns out to be listening — the walk has to fold that in and
+    finish, not hand out a pair or loop over the range re-checking it."""
+    r = _SomethingStartsListeningMidScan(
+        {
+            "sudo nine-manage-vhosts virtual-host list --json": "[]",
+            "ss -tlnp": "",
+            "ls -d /home/www-*/ 2>/dev/null": "",
+        },
+        later_ss=_listening(*range(PORT_RANGE_START, PORT_RANGE_END + 1)),
+    )
+    with pytest.raises(RuntimeError) as exc:
+        next_free_pair(r)
+    assert "No free port pair" in str(exc.value)
+    assert len([c for c in r.calls if c.startswith("ss -tlnp")]) == 2
+
+
+def test_next_free_pair_reports_an_exhausted_range_clearly():
+    r = FakeRunner({
+        "sudo nine-manage-vhosts virtual-host list --json": "[]",
+        "ss -tlnp": _listening(*range(PORT_RANGE_START, PORT_RANGE_END + 1)),
+        "ls -d /home/www-*/ 2>/dev/null": "",
+    })
+    with pytest.raises(RuntimeError) as exc:
+        next_free_pair(r)
+    assert "No free port pair" in str(exc.value)
+    assert f"{PORT_RANGE_START}-{PORT_RANGE_END}" in str(exc.value)
+
+
 def test_next_free_pair_skips_odd_allocated():
     r = FakeRunner({
         "sudo nine-manage-vhosts virtual-host list --json": """[
@@ -302,26 +411,32 @@ def test_next_free_pair_skips_odd_allocated():
 # --- Allocation for domain tests ----------------------------------------------
 
 
-def test_allocate_for_domain_new():
+def _decision_of(domain: str, runner) -> PortAllocation:
+    """The ports a claim hands out, for the tests that only care which they are."""
+    with claim_for_domain(domain, runner) as claim:
+        return claim.ports
+
+
+def test_claim_for_domain_new():
     r = _runner_with_data()
-    alloc = allocate_for_domain("example.com", r)
+    alloc = _decision_of("example.com", r)
     assert not alloc.is_reused
     assert alloc.app_port == 7016
     assert alloc.metrics_port == 7017
 
 
-def test_allocate_for_domain_multisite_reuse():
+def test_claim_for_domain_multisite_reuse():
     r = _runner_with_data()
-    alloc = allocate_for_domain("blog.example.ch", r)
+    alloc = _decision_of("blog.example.ch", r)
     assert alloc.is_reused
     assert alloc.app_port == 7014
     assert alloc.reused_from == "example.ch"
 
 
-def test_allocate_for_domain_not_found():
+def test_claim_for_domain_not_found():
     r = _runner_with_data()
     try:
-        allocate_for_domain("nonexistent.com", r)
+        _decision_of("nonexistent.com", r)
         assert False, "should have raised"
     except ValueError:
         pass
@@ -334,12 +449,12 @@ def test_find_port_for_domain():
     assert find_port_for_domain("nonexistent.com", r) is None
 
 
-def test_allocate_for_domain_with_existing_env_file():
+def test_claim_for_domain_with_existing_env_file():
     """A prepared-but-not-yet-cut-over domain must reuse its env-file port.
 
     This is the --prepare-only then --cutover-only scenario: the vhost
     template is still default_letsencrypt_https, but an env file exists
-    from the prepare step. allocate_for_domain must read the port from
+    from the prepare step. claim_for_domain must read the port from
     the env file rather than allocating a new pair.
     """
     env_example = "BIND=:7020\nMETRICS_BIND=:7021\nTARGET_HOST=origin-example.com\n"
@@ -352,7 +467,7 @@ def test_allocate_for_domain_with_existing_env_file():
         ),
         _su_key("cat -- /home/www-anubis/.config/anubis/example.com.env"): env_example,
     })
-    alloc = allocate_for_domain("example.com", r)
+    alloc = _decision_of("example.com", r)
     assert not alloc.is_reused
     assert alloc.app_port == 7020
     assert alloc.metrics_port == 7021
@@ -403,7 +518,7 @@ def test_find_prepared_port_for_webroot_no_match():
     assert port is None
 
 
-def test_allocate_for_domain_reuses_prepared_sibling():
+def test_claim_for_domain_reuses_prepared_sibling():
     """During --prepare-only, a domain sharing a webroot with an already-prepared
     sibling must reuse the sibling's port instead of allocating a new pair.
 
@@ -428,13 +543,13 @@ def test_allocate_for_domain_reuses_prepared_sibling():
         _su_key("cat -- /home/www-anubis/.config/anubis/site-a.ch.env"): env_a,
     })
     # site-b.ch shares webroot with site-a.ch which is already behind Anubis
-    alloc = allocate_for_domain("site-b.ch", r)
+    alloc = _decision_of("site-b.ch", r)
     assert alloc.is_reused
     assert alloc.app_port == 7020
     assert alloc.reused_from == "site-a.ch"
 
 
-def test_allocate_for_domain_reuses_prepared_sibling_not_yet_cut_over():
+def test_claim_for_domain_reuses_prepared_sibling_not_yet_cut_over():
     """During --prepare-only (no proxy vhost yet), a domain sharing a webroot
     with an already-prepared sibling must reuse the sibling's env-file port.
 
@@ -459,10 +574,131 @@ def test_allocate_for_domain_reuses_prepared_sibling_not_yet_cut_over():
         _su_key("cat -- /home/www-anubis/.config/anubis/site-a.ch.env"): env_a,
     })
     # Neither is behind Anubis, but site-a.ch has an env file
-    alloc = allocate_for_domain("site-b.ch", r)
+    alloc = _decision_of("site-b.ch", r)
     assert alloc.is_reused
     assert alloc.app_port == 7020
     assert alloc.reused_from == "site-a.ch"
+
+
+# --- Holding a claim against a concurrent run ---------------------------------
+
+
+def test_a_fresh_pair_is_held_until_the_claim_is_recorded(monkeypatch):
+    """The window the whole lock exists for: between deciding on a pair and
+    writing it into an env file, no other run may decide anything."""
+    monkeypatch.setattr(ports, "PORT_LOCK_TIMEOUT", 0.0)
+    r = _runner_with_data()
+    with claim_for_domain("example.com", r) as claim:
+        assert not claim.ports.is_reused
+        with pytest.raises(LockUnavailable):
+            with claim_for_domain("example.com", r):
+                pass
+        claim.release()
+        with claim_for_domain("example.com", r):
+            pass
+
+
+def test_a_claim_is_let_go_of_when_its_block_ends(monkeypatch):
+    """A run that fails between deciding and recording must not wedge the host."""
+    monkeypatch.setattr(ports, "PORT_LOCK_TIMEOUT", 0.0)
+    r = _runner_with_data()
+    with pytest.raises(ZeroDivisionError):
+        with claim_for_domain("example.com", r):
+            1 / 0
+    with claim_for_domain("example.com", r):
+        pass
+
+
+def test_reusing_an_instance_holds_nothing(monkeypatch):
+    """Reuse takes no new port, so it has no business keeping anyone waiting —
+    a 95-domain multisite batch is 94 reuses."""
+    monkeypatch.setattr(ports, "PORT_LOCK_TIMEOUT", 0.0)
+    r = _runner_with_data()
+    with claim_for_domain("blog.example.ch", r) as claim:
+        assert claim.ports.is_reused
+        with claim_for_domain("example.com", r) as fresh:
+            assert not fresh.ports.is_reused
+
+
+class _LiveHost:
+    """A host whose env files appear as runs record their claims.
+
+    A canned runner cannot show a race: both runs read the same fixed answer
+    whatever order they run in. This one answers from state the runs
+    themselves change, so the pair a run is handed depends on whether the
+    other run got there first — which is the thing under test."""
+
+    def __init__(self, vhosts_json: str):
+        self._vhosts = vhosts_json
+        self._guard = threading.Lock()
+        self._claimed: dict[str, int] = {}
+
+    def record(self, domain: str, port: int) -> None:
+        with self._guard:
+            self._claimed[domain] = port
+
+    def __call__(self, cmd: str, *, timeout: float = 60.0, what=None) -> str:
+        # A real command is a subprocess and a round trip, so a run spends
+        # most of its time between reads with its decision half-made. Without
+        # something standing in for that, two threads never overlap and the
+        # race this is about cannot happen even when nothing prevents it.
+        time.sleep(0.002)
+        with self._guard:
+            claimed = dict(self._claimed)
+        if cmd.startswith("sudo nine-manage-vhosts virtual-host list --json"):
+            return self._vhosts
+        if cmd.startswith("ss -tlnp"):
+            return ""
+        if cmd.startswith("ls -d /home/www-*/"):
+            return "/home/www-anubis/\n"
+        if cmd.startswith("test -d /home/www-anubis/.config/anubis"):
+            return "yes"
+        if "ls ~/.config/anubis/*.env" in cmd:
+            return "".join(
+                f"/home/www-anubis/.config/anubis/{d}.env\n" for d in claimed
+            )
+        if "cat -- " in cmd:
+            path = cmd.split("cat -- ", 1)[1].split()[0]
+            domain = path.rsplit("/", 1)[-1][: -len(".env")]
+            return f"BIND=:{claimed[domain]}\nMETRICS_BIND=:{claimed[domain] + 1}\n"
+        return ""
+
+
+TWO_UNPREPARED_DOMAINS = """[
+  {"domain": "site-a.ch", "user": "www-example", "webroot": "/home/www-example/a", "template": "default_letsencrypt_https", "template_variables": {}, "aliases": [], "jobs": []},
+  {"domain": "site-b.ch", "user": "www-example", "webroot": "/home/www-example/b", "template": "default_letsencrypt_https", "template_variables": {}, "aliases": [], "jobs": []}
+]"""
+
+
+def test_two_concurrent_runs_are_not_handed_the_same_pair(monkeypatch):
+    monkeypatch.setattr(ports, "PORT_LOCK_TIMEOUT", 10.0)
+    host = _LiveHost(TWO_UNPREPARED_DOMAINS)
+    domains = ["site-a.ch", "site-b.ch"]
+    both_ready = threading.Barrier(len(domains))
+    got: dict[str, int] = {}
+    failures: list[BaseException] = []
+
+    def run(domain: str) -> None:
+        try:
+            both_ready.wait(timeout=10)
+            with claim_for_domain(domain, host) as claim:
+                # What cmd_enable does with a claim: write the env file that
+                # records it, then let go.
+                host.record(domain, claim.ports.app_port)
+                got[domain] = claim.ports.app_port
+                claim.release()
+        except BaseException as e:  # noqa: BLE001 — reported, not swallowed
+            failures.append(e)
+
+    threads = [threading.Thread(target=run, args=(d,)) for d in domains]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+        assert not t.is_alive(), "a run never finished — the lock did not come back"
+
+    assert failures == []
+    assert sorted(got.values()) == [PORT_RANGE_START, PORT_RANGE_START + PAIR_STRIDE]
 
 
 # --- Untrusted input from nine-manage-vhosts JSON -----------------------------
@@ -530,10 +766,10 @@ def test_find_instance_for_webroot_rejects_injected_webroot():
     assert r.calls == []
 
 
-def test_allocate_for_domain_rejects_injected_domain():
+def test_claim_for_domain_rejects_injected_domain():
     r = _runner_with_data()
     with pytest.raises(ValidationError):
-        allocate_for_domain("example.com$(id)", r)
+        _decision_of("example.com$(id)", r)
     assert r.calls == []
 
 

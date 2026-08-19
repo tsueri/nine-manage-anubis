@@ -134,7 +134,7 @@ nine-manage-anubis enable --all --user <user>
 **What `enable` does (full flow):**
 
 1. Check the vhost isn't already behind Anubis
-2. Allocate a port pair (7010–7999), reusing an existing instance if the webroot already has one (multisite detection)
+2. Allocate a port pair (7010–7999), reusing an existing instance if the webroot already has one (multisite detection). A fresh pair is decided under a host-wide lock and held until step 4 writes it down, so two concurrent runs cannot be handed the same one
 3. Generate a JWT signing key
 4. Write the env file (`~/.config/anubis/<domain>.env`)
 5. Install the systemd template (if not already installed)
@@ -458,7 +458,9 @@ Visitor ──HTTPS──> Apache :443 (public vhost, proxy_letsencrypt_https_re
 
 Anubis sits between two Apache vhosts. The public vhost proxies to Anubis; Anubis proxies back to a private origin vhost. The origin dance (separate origin vhost + PHP shim + `.htaccess`) is unavoidable on nine for Apache/PHP backends.
 
-**Port allocation**: Anubis instances use the 7010–7999 port range. Each instance gets a pair (app + metrics): 7010/7011, 7012/7013, etc. The CLI auto-discovers the next free pair and reuses existing instances when vhosts share a webroot.
+**Port allocation**: Anubis instances use the 7010–7999 port range. Each instance gets a pair (app + metrics): 7010/7011, 7012/7013, etc. The CLI auto-discovers the next free pair and reuses existing instances when vhosts share a webroot. What counts as taken is read from three places — listening sockets, the ports named in env files, and the `PROXYPORT` of every proxy vhost — and the chosen pair is checked against a fresh listing of listening sockets once more before it is handed out.
+
+**Two runs cannot allocate the same pair**: allocating is read-decide-claim, and nothing on the host says a port is taken until the env file naming it exists. Two `enable` runs started close together would otherwise read the same answer, pick the same pair and both write it — the second instance then fails to bind, and its vhost points at a port serving someone else's site. So the whole sequence runs under an exclusive `flock` on `/run/lock/nine-manage-anubis-ports.lock`, held from the first read until the env file records the pair and released there — not across the certificate request and service start that follow. A run that reuses an existing instance takes no new port and holds nothing, which is what a 95-domain multisite batch mostly consists of. The lock is a kernel lock rather than a file whose existence means "held", so a run that is killed rather than finished leaves nothing behind to reap; a run that waits more than two minutes for it gives up and says which file to look at rather than hanging. `/run/lock` belongs to root and is emptied on reboot, so the first run after one creates the lock file through `sudo`.
 
 **Multisite reuse**: when `enable` detects that a domain's webroot already has an Anubis instance, it reuses that port — no new env file, key, or service instance. All domains sharing a webroot proxy to the same Anubis port.
 

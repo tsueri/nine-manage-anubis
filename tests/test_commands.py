@@ -6,6 +6,8 @@ import pytest
 
 from conftest import hostile
 from shellparse import argv, script_argv
+from nine_manage_anubis import ports
+from nine_manage_anubis.locking import ExclusiveLock, LockUnavailable
 from nine_manage_anubis.runner import CommandFailed, CommandTimeout, FakeRunner
 from nine_manage_anubis.validate import ValidationError
 from nine_manage_anubis.commands import (
@@ -247,6 +249,93 @@ def test_the_env_and_key_files_an_enable_writes_are_the_owners_alone():
         ]
         assert len(write) == 1, f"{name} was not written exactly once"
         assert "umask 177" in write[0].splitlines()
+
+
+def _allocation_lock_is_free() -> bool:
+    """Whether a second run could take the port lock at this instant."""
+    try:
+        with ExclusiveLock(
+            ports.PORT_LOCK_PATH, what="probe", runner=FakeRunner(), timeout=0.0
+        ):
+            return True
+    except LockUnavailable:
+        return False
+
+
+class _LockWatchingRunner(FakeRunner):
+    """Records whether the port lock is free at chosen moments of a command.
+
+    Keyed by a phrase from the command that marks the moment — a run is only
+    observable from the outside through the commands it issues."""
+
+    def __init__(self, responses: dict[str, str], marks: dict[str, str]):
+        super().__init__(responses)
+        self._marks = marks
+        self.free_at: dict[str, bool] = {}
+
+    def __call__(self, cmd, **kwargs):
+        for label, needle in self._marks.items():
+            if needle in cmd and label not in self.free_at:
+                self.free_at[label] = _allocation_lock_is_free()
+        return super().__call__(cmd, **kwargs)
+
+
+def test_enable_holds_the_port_pair_until_the_env_file_records_it():
+    """The claim covers the gap between deciding on a pair and writing it down.
+
+    Before the env file exists, nothing on the host says the port is taken, so
+    a concurrent run would pick the same one — hence the hold. After it, the
+    scan every run does finds it, so the hold ends: what is left of an enable
+    is a certificate request and a service start, and a host-wide lock has no
+    business spanning those."""
+    r = _LockWatchingRunner(
+        _base_runner().responses,
+        {
+            "before the env file": (
+                "cat > /home/www-anubis/.config/anubis/example.com.key"
+            ),
+            "after the env file": "virtual-host create",
+        },
+    )
+    result = cmd_enable("example.com", runner=r)
+    assert result.success
+    assert r.free_at["before the env file"] is False
+    assert r.free_at["after the env file"] is True
+    assert _allocation_lock_is_free()
+
+
+def test_enable_does_not_hold_the_port_lock_through_a_dry_run():
+    """A dry run promises nothing, so it has nothing to hold anyone up over."""
+    r = _LockWatchingRunner(
+        _base_runner().responses, {"during the dry run": "openssl rand -hex 32"}
+    )
+    result = cmd_enable("example.com", runner=r, dry_run=True)
+    assert result.success
+    assert r.free_at["during the dry run"] is True
+
+
+def test_enable_does_not_hold_the_port_lock_through_a_cutover():
+    """--cutover-only writes no env file, so it records no claim — and it may
+    request a certificate, which is no place to be holding a host-wide lock."""
+    r = _LockWatchingRunner(
+        _base_runner().responses, {"during the cutover": "certificate list"}
+    )
+    result = cmd_enable("example.com", runner=r, cutover_only=True)
+    assert result.success
+    assert r.free_at["during the cutover"] is True
+
+
+def test_enable_lets_the_port_lock_go_when_it_fails():
+    """A failed enable must not leave the next one unable to allocate."""
+
+    def failing_runner(cmd: str, **kwargs) -> str:
+        if "systemctl --user enable" in cmd:
+            raise RuntimeError("systemctl enable failed")
+        return _base_runner()(cmd, **kwargs)
+
+    result = cmd_enable("example.com", runner=failing_runner)
+    assert not result.success
+    assert _allocation_lock_is_free()
 
 
 def test_enable_prepare_only():

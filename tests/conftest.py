@@ -5,8 +5,27 @@ import stat
 import sys
 from pathlib import Path
 
+import pytest
+
 # Ensure src/ is importable without installation.
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+
+from nine_manage_anubis import ports  # noqa: E402  (needs the path above)
+
+
+@pytest.fixture(autouse=True)
+def port_lock_in_a_temporary_file(tmp_path_factory, monkeypatch):
+    """Point the allocation lock at a file of this test's own.
+
+    Every enable goes through the lock, so without this the suite would take
+    the host's real one — serialising unrelated tests behind each other and
+    behind anything actually running on the developer's machine. The short
+    timeout is a tripwire: no test but the concurrency ones should ever
+    contend, and one that does should say so rather than look like a hang.
+    """
+    path = tmp_path_factory.mktemp("port-lock") / "ports.lock"
+    monkeypatch.setattr(ports, "PORT_LOCK_PATH", str(path))
+    monkeypatch.setattr(ports, "PORT_LOCK_TIMEOUT", 2.0)
 
 
 # The website user a webroot belongs to — the account nine-su switches to, and

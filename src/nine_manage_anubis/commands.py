@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from .runner import CommandFailed, CommandTimeout, Runner, SubprocessRunner
 from .ports import (
     AnubisInstance,
-    allocate_for_domain,
+    claim_for_domain,
     discover_instances,
     find_vhosts_for_port,
     get_vhost,
@@ -508,135 +508,149 @@ def cmd_enable(
         result.error = f"{domain} is already behind Anubis"
         return result
 
-    alloc = allocate_for_domain(domain, runner=runner)
+    with claim_for_domain(domain, runner=runner) as claim:
+        alloc = claim.ports
 
-    if alloc.is_reused:
-        result.steps.append(
-            f"Reusing existing Anubis instance for {alloc.reused_from} "
-            f"(port {alloc.app_port})"
-        )
-        if dry_run:
+        if dry_run or cutover_only:
+            # Neither writes an env file, so neither will ever record this
+            # pair — a dry run promises nothing, and a cutover is finishing
+            # what a previous `--prepare-only` already wrote down. Holding a
+            # host-wide lock over the certificate request a cutover may make
+            # would stall every other run for nothing.
+            claim.release()
+
+        if alloc.is_reused:
+            result.steps.append(
+                f"Reusing existing Anubis instance for {alloc.reused_from} "
+                f"(port {alloc.app_port})"
+            )
+            if dry_run:
+                if not prepare_only:
+                    result.steps.append(f"Would switch {domain} to proxy template (PROXYPORT={alloc.app_port})")
+                return result
+
+            if not cutover_only:
+                result.warnings.append(
+                    f"{domain} shares webroot with {alloc.reused_from} — "
+                    f"fixups should already be installed"
+                )
+
             if not prepare_only:
-                result.steps.append(f"Would switch {domain} to proxy template (PROXYPORT={alloc.app_port})")
+                undo_stack: list[UndoStep] = []
+                try:
+                    if not certificate_exists(domain, runner=runner):
+                        create_certificate(domain, runner=runner)
+                        result.steps.append(f"Created Let's Encrypt certificate for {domain}")
+                    switch_to_proxy(domain, alloc.app_port, no_notify=no_notify, runner=runner)
+                    undo_stack.append(UndoStep(
+                        _public_vhost(domain),
+                        lambda: switch_to_default(domain, no_notify=no_notify, runner=runner),
+                    ))
+                    result.steps.append(f"Switched {domain} to proxy template (PROXYPORT={alloc.app_port})")
+                except Exception as e:
+                    _fail_with_rollback(undo_stack, result, e, action="Enable")
+                    return result
             return result
 
+        config = AnubisConfig(
+            domain=domain,
+            app_port=alloc.app_port,
+            metrics_port=alloc.metrics_port,
+            anubis_user=anubis_user,
+            key_path=key_path_for(anubis_user, domain),
+        )
+
+        undo_stack: list[UndoStep] = []
+        ops = RemoteFileOps(website_user, runner)
+
         if not cutover_only:
-            result.warnings.append(
-                f"{domain} shares webroot with {alloc.reused_from} — "
-                f"fixups should already be installed"
-            )
+            key_content = generate_key(runner=runner)
+            result.steps.append(f"Generated JWT key")
+
+            env_content = generate_env_file(config, policy_file=policy_file)
+            result.steps.append(f"Prepared env file ({config.env_path})")
+
+            if not template_exists(anubis_user, runner=runner):
+                if dry_run:
+                    result.steps.append("Would install systemd template anubis@.service")
+                else:
+                    write_systemd_template(anubis_user, SYSTEMD_TEMPLATE, runner=runner)
+                    daemon_reload(anubis_user, runner=runner)
+                    result.steps.append("Installed systemd template anubis@.service")
+            else:
+                result.steps.append("Systemd template already installed")
+
+            fixup_plan = apply_fixups(webroot, ops, dry_run=True)
+            result.steps.extend(f"Fixup: {s}" for s in fixup_plan.steps)
+
+            result.steps.append(f"Create origin vhost origin-{domain}")
+
+            result.steps.append(f"Start anubis@{domain}.service")
+
+            if not dry_run:
+                try:
+                    write_key_file(anubis_user, config.key_path, key_content, runner=runner)
+                    undo_stack.append(UndoStep(
+                        _key_file(config.key_path),
+                        lambda: remove_file(anubis_user, config.key_path, runner=runner),
+                    ))
+
+                    write_env_file(anubis_user, config.env_path, env_content, runner=runner)
+                    undo_stack.append(UndoStep(
+                        _env_file(config.env_path),
+                        lambda: remove_file(anubis_user, config.env_path, runner=runner),
+                    ))
+                    # The env file is what records the pair, so from here the
+                    # port is everyone else's business and the hold has done
+                    # its work. A rollback below removes the file again, which
+                    # frees the port for whoever asks next.
+                    claim.release()
+
+                    if not template_exists(anubis_user, runner=runner):
+                        write_systemd_template(anubis_user, SYSTEMD_TEMPLATE, runner=runner)
+
+                    daemon_reload(anubis_user, runner=runner)
+
+                    apply_fixups(webroot, ops, dry_run=False)
+                    undo_stack.append(UndoStep(
+                        _webroot_fixups(webroot),
+                        lambda: restore_fixups(webroot, ops, dry_run=False),
+                    ))
+
+                    create_origin_vhost(domain, website_user, webroot, php_version, no_notify=no_notify, runner=runner)
+                    undo_stack.append(UndoStep(
+                        _origin_vhost(domain),
+                        lambda: remove_origin_vhost(domain, no_notify=no_notify, runner=runner),
+                    ))
+
+                    enable_service(anubis_user, domain, runner=runner)
+                    undo_stack.append(UndoStep(
+                        _service(domain),
+                        lambda: disable_service(anubis_user, domain, runner=runner),
+                    ))
+                except Exception as e:
+                    _fail_with_rollback(undo_stack, result, e, action="Enable")
+                    return result
 
         if not prepare_only:
-            undo_stack: list[UndoStep] = []
-            try:
-                if not certificate_exists(domain, runner=runner):
-                    create_certificate(domain, runner=runner)
-                    result.steps.append(f"Created Let's Encrypt certificate for {domain}")
-                switch_to_proxy(domain, alloc.app_port, no_notify=no_notify, runner=runner)
-                undo_stack.append(UndoStep(
-                    _public_vhost(domain),
-                    lambda: switch_to_default(domain, no_notify=no_notify, runner=runner),
-                ))
-                result.steps.append(f"Switched {domain} to proxy template (PROXYPORT={alloc.app_port})")
-            except Exception as e:
-                _fail_with_rollback(undo_stack, result, e, action="Enable")
-                return result
-        return result
-
-    config = AnubisConfig(
-        domain=domain,
-        app_port=alloc.app_port,
-        metrics_port=alloc.metrics_port,
-        anubis_user=anubis_user,
-        key_path=key_path_for(anubis_user, domain),
-    )
-
-    undo_stack: list[UndoStep] = []
-    ops = RemoteFileOps(website_user, runner)
-
-    if not cutover_only:
-        key_content = generate_key(runner=runner)
-        result.steps.append(f"Generated JWT key")
-
-        env_content = generate_env_file(config, policy_file=policy_file)
-        result.steps.append(f"Prepared env file ({config.env_path})")
-
-        if not template_exists(anubis_user, runner=runner):
             if dry_run:
-                result.steps.append("Would install systemd template anubis@.service")
+                result.steps.append(f"Would cut over {domain} to proxy template (PROXYPORT={alloc.app_port})")
             else:
-                write_systemd_template(anubis_user, SYSTEMD_TEMPLATE, runner=runner)
-                daemon_reload(anubis_user, runner=runner)
-                result.steps.append("Installed systemd template anubis@.service")
-        else:
-            result.steps.append("Systemd template already installed")
+                try:
+                    if not certificate_exists(domain, runner=runner):
+                        create_certificate(domain, runner=runner)
+                        result.steps.append(f"Created Let's Encrypt certificate for {domain}")
+                    switch_to_proxy(domain, alloc.app_port, no_notify=no_notify, runner=runner)
+                    undo_stack.append(UndoStep(
+                        _public_vhost(domain),
+                        lambda: switch_to_default(domain, no_notify=no_notify, runner=runner),
+                    ))
+                    result.steps.append(f"Cut over {domain} to proxy template (PROXYPORT={alloc.app_port})")
+                except Exception as e:
+                    _fail_with_rollback(undo_stack, result, e, action="Enable")
+                    return result
 
-        fixup_plan = apply_fixups(webroot, ops, dry_run=True)
-        result.steps.extend(f"Fixup: {s}" for s in fixup_plan.steps)
-
-        result.steps.append(f"Create origin vhost origin-{domain}")
-
-        result.steps.append(f"Start anubis@{domain}.service")
-
-        if not dry_run:
-            try:
-                write_key_file(anubis_user, config.key_path, key_content, runner=runner)
-                undo_stack.append(UndoStep(
-                    _key_file(config.key_path),
-                    lambda: remove_file(anubis_user, config.key_path, runner=runner),
-                ))
-
-                write_env_file(anubis_user, config.env_path, env_content, runner=runner)
-                undo_stack.append(UndoStep(
-                    _env_file(config.env_path),
-                    lambda: remove_file(anubis_user, config.env_path, runner=runner),
-                ))
-
-                if not template_exists(anubis_user, runner=runner):
-                    write_systemd_template(anubis_user, SYSTEMD_TEMPLATE, runner=runner)
-
-                daemon_reload(anubis_user, runner=runner)
-
-                apply_fixups(webroot, ops, dry_run=False)
-                undo_stack.append(UndoStep(
-                    _webroot_fixups(webroot),
-                    lambda: restore_fixups(webroot, ops, dry_run=False),
-                ))
-
-                create_origin_vhost(domain, website_user, webroot, php_version, no_notify=no_notify, runner=runner)
-                undo_stack.append(UndoStep(
-                    _origin_vhost(domain),
-                    lambda: remove_origin_vhost(domain, no_notify=no_notify, runner=runner),
-                ))
-
-                enable_service(anubis_user, domain, runner=runner)
-                undo_stack.append(UndoStep(
-                    _service(domain),
-                    lambda: disable_service(anubis_user, domain, runner=runner),
-                ))
-            except Exception as e:
-                _fail_with_rollback(undo_stack, result, e, action="Enable")
-                return result
-
-    if not prepare_only:
-        if dry_run:
-            result.steps.append(f"Would cut over {domain} to proxy template (PROXYPORT={alloc.app_port})")
-        else:
-            try:
-                if not certificate_exists(domain, runner=runner):
-                    create_certificate(domain, runner=runner)
-                    result.steps.append(f"Created Let's Encrypt certificate for {domain}")
-                switch_to_proxy(domain, alloc.app_port, no_notify=no_notify, runner=runner)
-                undo_stack.append(UndoStep(
-                    _public_vhost(domain),
-                    lambda: switch_to_default(domain, no_notify=no_notify, runner=runner),
-                ))
-                result.steps.append(f"Cut over {domain} to proxy template (PROXYPORT={alloc.app_port})")
-            except Exception as e:
-                _fail_with_rollback(undo_stack, result, e, action="Enable")
-                return result
-
-    return result
+        return result
 
 
 # --- disable ------------------------------------------------------------------
