@@ -26,6 +26,9 @@ from nine_manage_anubis.systemd import (
     download_binary,
     extract_policy,
     get_latest_version,
+    DOWNLOAD_TIMEOUT,
+    RELEASE_QUERY_TIMEOUT,
+    SERVICE_TIMEOUT,
 )
 from nine_manage_anubis.config import SYSTEMD_TEMPLATE
 
@@ -213,13 +216,22 @@ def test_download_binary():
 
 def test_get_latest_version():
     r = FakeRunner({
-        "curl -sL https://api.github.com/repos/TecharoHQ/anubis/releases/latest": '',
+        "curl -sL https://api.github.com/repos/TecharoHQ/anubis/releases/latest":
+            '{"tag_name": "v1.27.0", "name": "v1.27.0"}',
     })
-    # The actual command pipes to grep, so we need to match the full command
-    r.responses["curl -sL https://api.github.com/repos/TecharoHQ/anubis/releases/latest "
-                "| grep -m1 '\"tag_name\"'"] = '"tag_name": "v1.27.0"'
-    v = get_latest_version(r)
-    assert v == "1.27.0"
+    assert get_latest_version(r) == "1.27.0"
+
+
+def test_get_latest_version_asks_one_program_so_a_failure_names_it():
+    # A pipeline exits with its last command's status, so `curl | grep` reported
+    # curl as the program that failed whenever grep was the one that found
+    # nothing.
+    r = FakeRunner({
+        "curl -sL https://api.github.com/repos/TecharoHQ/anubis/releases/latest":
+            '{"tag_name": "v1.27.0"}',
+    })
+    get_latest_version(r)
+    assert "|" not in r.calls[0]
 
 
 # --- Quoting -------------------------------------------------------------------
@@ -386,3 +398,56 @@ def test_extract_policy_quotes_the_scratch_directory():
     words = script_argv(r.calls[0])
     assert f"/tmp/anubis-extract-{HOSTILE_USER}" in words
     assert f"/tmp/anubis-extract-{HOSTILE_USER}/data/botPolicies.yaml" in words
+
+
+# --- Timeouts -----------------------------------------------------------------
+#
+# Every command here runs under one. The two that reach the network get their
+# own, because a release download is legitimately slower than anything else
+# this tool does — and a stalled one used to block the run for good.
+
+
+@pytest.mark.parametrize("call", [enable_service, disable_service, restart_service])
+def test_a_service_change_runs_under_the_service_timeout(call):
+    r = FakeRunner()
+    call("www-anubis", "example.com", runner=r)
+    assert r.invocations[0].timeout == SERVICE_TIMEOUT
+    assert "anubis@example.com.service" in r.invocations[0].what
+
+
+def test_a_binary_download_runs_under_the_download_timeout():
+    r = FakeRunner()
+    download_binary("www-anubis", "1.27.0", runner=r)
+    assert r.invocations[0].timeout == DOWNLOAD_TIMEOUT
+    assert "1.27.0" in r.invocations[0].what
+
+
+def test_a_binary_download_also_limits_curl_on_the_far_side():
+    # This curl runs as another user through nine-su, so it is the one place
+    # our own kill can be refused — curl's clock cannot be.
+    r = FakeRunner()
+    download_binary("www-anubis", "1.27.0", runner=r)
+    words = script_argv(r.calls[0])
+    assert "--max-time" in words
+    assert int(words[words.index("--max-time") + 1]) < DOWNLOAD_TIMEOUT
+
+
+def test_a_release_query_runs_under_the_release_query_timeout():
+    r = FakeRunner({"curl -sL https://api.github.com": '"tag_name": "v1.27.0"'})
+    get_latest_version(runner=r)
+    assert r.invocations[0].timeout == RELEASE_QUERY_TIMEOUT
+    assert r.invocations[0].what
+
+
+def test_generating_a_key_names_the_operation_and_not_the_key():
+    r = FakeRunner({"openssl rand -hex 32": "deadbeef\n"})
+    generate_key(runner=r)
+    what = r.invocations[0].what
+    assert what
+    assert "deadbeef" not in what
+
+
+def test_a_file_write_names_the_path_it_was_writing():
+    r = FakeRunner()
+    write_env_file("www-anubis", "/home/www-anubis/.config/anubis/e.env", "BIND=:7010\n", runner=r)
+    assert "/home/www-anubis/.config/anubis/e.env" in r.invocations[0].what

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from .runner import Runner, SubprocessRunner
+from .runner import CommandTimeout, Runner, SubprocessRunner
 from .ports import (
     AnubisInstance,
     allocate_for_domain,
@@ -69,6 +69,13 @@ from .validate import (
 DEFAULT_ANUBIS_USER = "www-anubis"
 ANUBIS_VERSION = "1.27.0"
 
+# A healthy instance answers a loopback probe in milliseconds, so this bounds
+# the case the limit exists for: an instance wedged badly enough to accept the
+# connection and never reply. curl gets no --max-time of its own here — the
+# probe runs locally and unprivileged, so the runner's own kill lands, and the
+# failure then reads as a timeout rather than as curl exit code 28.
+PROBE_TIMEOUT = 10.0
+
 
 def _validate_inputs(
     anubis_user: str | None = None,
@@ -104,9 +111,22 @@ def _http_probe(domain: str, port: int, runner: Runner) -> str:
     response = runner(
         f"curl -s -o /dev/null -w {quote('%{http_code}')} "
         f"-H {quote('X-Real-Ip: 127.0.0.1')} -H {quote(f'Host: {domain}')} "
-        f"{quote(f'http://localhost:{port}/')}"
+        f"{quote(f'http://localhost:{port}/')}",
+        timeout=PROBE_TIMEOUT,
+        what=f"probing {domain} on port {port}",
     )
     return response.strip()
+
+
+# What a probe that never answered is called, wherever it is reported: as a
+# health column in `status`, and inside the warning below everywhere else. One
+# phrase, because an operator comparing the two is looking at one instance.
+PROBE_TIMED_OUT = f"timed out after {PROBE_TIMEOUT:g}s"
+
+
+def _probe_timed_out(domain: str) -> str:
+    """The warning a command raises about an instance whose probe never answered."""
+    return f"anubis@{domain}.service HTTP probe {PROBE_TIMED_OUT}"
 
 
 @dataclass
@@ -507,6 +527,12 @@ def cmd_upgrade(
                     result.warnings.append(f"anubis@{inst.domain}.service HTTP probe returned {code}")
                     result.error = f"Health check failed for {inst.domain} (HTTP {code})"
                     return result
+            except CommandTimeout:
+                # A probe that never answered is the wedged instance a rolling
+                # restart exists to catch, not a probe to shrug at.
+                result.warnings.append(_probe_timed_out(inst.domain))
+                result.error = f"Health check failed for {inst.domain} (probe timed out)"
+                return result
             except Exception:
                 result.steps.append(f"  Health check: active (service, HTTP probe skipped)")
 
@@ -536,6 +562,8 @@ def cmd_status(
                 try:
                     code = _http_probe(inst.domain, inst.port, runner)
                     health_map[inst.domain] = f"HTTP {code}" if code else "no response"
+                except CommandTimeout:
+                    health_map[inst.domain] = PROBE_TIMED_OUT
                 except Exception:
                     health_map[inst.domain] = "error"
             else:
@@ -606,6 +634,8 @@ def cmd_selftest(
             else:
                 result.warnings.append(
                     f"anubis@{inst.domain}.service HTTP probe returned {code}")
+        except CommandTimeout:
+            result.warnings.append(_probe_timed_out(inst.domain))
         except Exception:
             result.warnings.append(f"anubis@{inst.domain}.service HTTP probe failed")
 
@@ -667,6 +697,10 @@ def cmd_restart(
                     )
                     result.error = f"Health check failed for {inst.domain} (HTTP {code})"
                     return result
+            except CommandTimeout:
+                result.warnings.append(_probe_timed_out(inst.domain))
+                result.error = f"Health check failed for {inst.domain} (probe timed out)"
+                return result
             except Exception:
                 result.steps.append(f"  Health check: active (service, HTTP probe skipped)")
 

@@ -173,8 +173,10 @@ def main(argv: Sequence[str] | None = None, runner=None) -> int:
     """Entry point — turns unhandled failures into a one-line error.
 
     Operators run this over SSH; a Python traceback tells them nothing they
-    can act on. The underlying exception message already carries the failing
-    command and its stderr.
+    can act on. The underlying exception already says what is worth saying: a
+    failed command names the program, the exit code and stderr, a timed-out one
+    names the operation and the limit it passed. Neither quotes the command —
+    that is the part which can carry a signing key.
     """
     try:
         return _dispatch(argv, runner)

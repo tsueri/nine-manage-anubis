@@ -464,12 +464,20 @@ Anubis sits between two Apache vhosts. The public vhost proxies to Anubis; Anubi
 
 **Rollback**: if `enable` fails after making changes, the CLI undoes every step in reverse order (switch vhost back, remove origin vhost, restore fixup files, remove env/key, disable service).
 
+**Failures and timeouts**: a failing external command is reported as the program, its exit code and its stderr — never as the command string, which can carry a freshly generated signing key. Every command runs under a timeout (60s by default; longer for a binary download, a certificate request or a service change), and overrunning it produces a `timed out after Ns` error naming the operation instead of a run that hangs with no output.
+
 For the full manual runbook, see [docs/runbook.md](docs/runbook.md).
+
+## Known limitations
+
+**A signing key is visible to `ps` while it is being written.** Every command runs as an argument of `/bin/sh -c`, and a new instance's signing key travels to disk as a heredoc body inside that command — so for as long as that one write takes, a local user running `ps` can see it. Error messages never quote a command, so the key does not reach terminals, CI logs or bug reports; closing the `ps` window as well needs the script to reach `nine-su` on stdin rather than as part of the command string, which changes how every command is built.
+
+**A timeout cannot always kill what it gave up on.** The timeout is enforced locally, and most commands run through `sudo` — by the time one hangs it is root, and the signal to stop it can be refused. The CLI stops waiting and reports the timeout rather than blocking, but the abandoned command may still be running on the host. `nine-manage-anubis status` shows what actually happened before you retry.
 
 ## Development
 
 ```sh
-# Run tests (173 tests, stdlib only)
+# Run the test suite (stdlib only)
 python -m pytest -q
 
 # Install in development mode

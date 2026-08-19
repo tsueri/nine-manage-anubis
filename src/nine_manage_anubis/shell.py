@@ -51,9 +51,12 @@ class HeredocCollision(RuntimeError):
 def quote(value: str | int) -> str:
     """Return ``value`` as a single shell word.
 
-    Safe values are returned unchanged, so commands stay readable in logs and
-    in the ``Command failed`` message; anything else is single-quoted, which
-    disarms every metacharacter a POSIX shell knows.
+    Safe values are returned unchanged, so a command stays readable to whoever
+    is looking at one; anything else is single-quoted, which disarms every
+    metacharacter a POSIX shell knows. A failure is not one of those places any
+    more — :mod:`~nine_manage_anubis.runner` reports the program, the exit code
+    and stderr, and withholds the command — so readability here is a
+    convenience for a human debugging, not part of a diagnostic.
     """
     return shlex.quote(str(value))
 

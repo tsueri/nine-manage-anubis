@@ -4,7 +4,7 @@ import pytest
 
 from conftest import hostile
 from shellparse import argv
-from nine_manage_anubis.runner import FakeRunner
+from nine_manage_anubis.runner import CommandTimeout, FakeRunner
 from nine_manage_anubis.validate import ValidationError
 from nine_manage_anubis.commands import (
     _http_probe,
@@ -17,6 +17,7 @@ from nine_manage_anubis.commands import (
     cmd_status,
     cmd_selftest,
     DEFAULT_ANUBIS_USER,
+    PROBE_TIMEOUT,
 )
 
 _SU = "sudo nine-su www-anubis <<'NINE_SU_EOF'\n"
@@ -65,8 +66,7 @@ def _base_runner(**overrides) -> FakeRunner:
         "sudo nine-manage-vhosts certificate create": "",
         "sudo nine-manage-vhosts user create": "",
         "sudo nine-manage-vhosts user remove": "",
-        "curl -sL https://api.github.com/repos/TecharoHQ/anubis/releases/latest "
-        "| grep -m1 '\"tag_name\"'": '"tag_name": "v1.27.0"',
+        "curl -sL https://api.github.com/repos/TecharoHQ/anubis/releases/latest": '"tag_name": "v1.27.0"',
         "curl -s -o /dev/null -w '%{http_code}'": "200",
     }
     responses.update(overrides)
@@ -458,12 +458,12 @@ def test_enable_rollback_on_service_enable_failure():
     """If enable_service raises, rollback undoes fixups + origin vhost + env/key."""
     call_count = {"enable": 0}
 
-    def failing_runner(cmd: str) -> str:
+    def failing_runner(cmd: str, **kwargs) -> str:
         r = _base_runner()
         if "systemctl --user enable" in cmd:
             call_count["enable"] += 1
             raise RuntimeError("systemctl enable failed")
-        return r(cmd)
+        return r(cmd, **kwargs)
 
     result = cmd_enable("example.com", runner=failing_runner)
     assert not result.success
@@ -474,11 +474,11 @@ def test_enable_rollback_on_service_enable_failure():
 
 def test_enable_rollback_on_cutover_failure():
     """If switch_to_proxy raises, rollback undoes service + fixups + origin vhost + env/key."""
-    def failing_runner(cmd: str) -> str:
+    def failing_runner(cmd: str, **kwargs) -> str:
         r = _base_runner()
         if "virtual-host update example.com" in cmd and "--template=proxy_letsencrypt_https_redirect" in cmd:
             raise RuntimeError("cutover failed")
-        return r(cmd)
+        return r(cmd, **kwargs)
 
     result = cmd_enable("example.com", runner=failing_runner)
     assert not result.success
@@ -507,10 +507,10 @@ def test_enable_reused_webroot_rollback_on_cutover_failure():
         _SU + "cat -- /home/www-anubis/.config/anubis/example.ch.env": "BIND=:7014\nMETRICS_BIND=:7015\nTARGET_HOST=origin-example.ch\n",
     })
 
-    def failing_runner(cmd: str) -> str:
+    def failing_runner(cmd: str, **kwargs) -> str:
         if "virtual-host update blog.example.ch" in cmd and "--template=proxy_letsencrypt_https_redirect" in cmd:
             raise RuntimeError("cutover failed")
-        return r(cmd)
+        return r(cmd, **kwargs)
 
     result = cmd_enable("blog.example.ch", runner=failing_runner)
     assert not result.success
@@ -543,10 +543,10 @@ def test_enable_reuse_creates_certificate_if_missing():
     cert_commands = []
     original_run = r
 
-    def tracking_runner(cmd: str) -> str:
+    def tracking_runner(cmd: str, **kwargs) -> str:
         if "certificate create" in cmd:
             cert_commands.append(cmd)
-        return original_run(cmd)
+        return original_run(cmd, **kwargs)
 
     result = cmd_enable("blog.example.ch", runner=tracking_runner)
     assert result.success
@@ -688,8 +688,7 @@ def test_cmd_enable_rejects_malformed_policy_file():
 def test_cmd_upgrade_rejects_malformed_version_from_github():
     """get_latest_version parses an HTTP response — untrusted."""
     r = _base_runner(**{
-        "curl -sL https://api.github.com/repos/TecharoHQ/anubis/releases/latest "
-        "| grep -m1 '\"tag_name\"'": '"tag_name": "v1.27.0; id"',
+        "curl -sL https://api.github.com/repos/TecharoHQ/anubis/releases/latest": '"tag_name": "v1.27.0; id"',
     })
     with pytest.raises(ValidationError) as exc:
         cmd_upgrade(runner=r)
@@ -742,3 +741,54 @@ def test_every_health_check_uses_the_same_probe():
         assert probes, f"{command.__name__} did not probe"
         assert all(p == probes[0] for p in probes)
         assert "'Host: test.example.ch'" in probes[0]
+
+
+# --- A probe that never answers -----------------------------------------------
+#
+# The motivating case: an instance wedged badly enough to accept a connection
+# and never reply. The probe is what notices, so a probe that hangs used to
+# take the whole run with it — and once it is bounded, a timeout has to read as
+# a failed health check rather than as one that was skipped.
+
+
+class _ProbeNeverAnswers(FakeRunner):
+    """Every command answers as usual except the health probe, which hangs."""
+
+    def __call__(self, cmd, **kwargs):
+        if cmd.startswith("curl -s -o /dev/null"):
+            raise CommandTimeout("curl", PROBE_TIMEOUT, kwargs.get("what"))
+        return super().__call__(cmd, **kwargs)
+
+
+def _wedged_runner() -> _ProbeNeverAnswers:
+    return _ProbeNeverAnswers(_base_runner().responses)
+
+
+def test_every_health_check_runs_the_probe_under_the_probe_timeout():
+    for command in (cmd_status, cmd_selftest, cmd_restart, cmd_upgrade):
+        r = _base_runner()
+        kwargs = {"health": True} if command is cmd_status else {}
+        command(runner=r, **kwargs)
+        probe = r.invocation("curl -s -o /dev/null")
+        assert probe.timeout == PROBE_TIMEOUT, command.__name__
+        assert "test.example.ch" in probe.what, command.__name__
+
+
+def test_status_reports_a_probe_that_timed_out_as_such():
+    _, health_map = cmd_status(health=True, runner=_wedged_runner())
+    assert health_map is not None
+    assert "timed out" in health_map["test.example.ch"]
+
+
+def test_selftest_counts_a_probe_that_timed_out_as_a_failed_check():
+    result = cmd_selftest(runner=_wedged_runner())
+    assert not result.success
+    assert any("timed out" in w for w in result.warnings)
+
+
+@pytest.mark.parametrize("command", [cmd_restart, cmd_upgrade])
+def test_a_rolling_restart_stops_when_a_health_probe_times_out(command):
+    result = command(runner=_wedged_runner())
+    assert not result.success
+    assert "timed out" in " ".join(result.warnings)
+    assert "test.example.ch" in result.error

@@ -7,7 +7,12 @@ from contextlib import redirect_stdout, redirect_stderr
 import pytest
 
 from conftest import hostile, hostile_metacharacters
-from nine_manage_anubis.runner import FakeRunner
+from nine_manage_anubis.runner import (
+    CommandFailed,
+    CommandTimeout,
+    FakeRunner,
+    program_name,
+)
 from nine_manage_anubis.cli import main, build_parser, _resolve_domains
 from nine_manage_anubis.settings import Settings
 
@@ -55,8 +60,7 @@ def _runner(**overrides) -> FakeRunner:
         "sudo nine-manage-vhosts certificate create": "",
         "sudo nine-manage-vhosts user create": "",
         "sudo nine-manage-vhosts user remove": "",
-        "curl -sL https://api.github.com/repos/TecharoHQ/anubis/releases/latest "
-        "| grep -m1 '\"tag_name\"'": '"tag_name": "v1.27.0"',
+        "curl -sL https://api.github.com/repos/TecharoHQ/anubis/releases/latest": '"tag_name": "v1.27.0"',
         "curl -s -o /dev/null -w '%{http_code}'": "200",
     }
     responses.update(overrides)
@@ -380,13 +384,56 @@ def test_command_failure_prints_error_not_traceback():
     """A failing external command must surface as a one-line error, not a
     Python traceback dumped in the operator's face."""
     class _Boom(FakeRunner):
-        def __call__(self, cmd):
-            raise RuntimeError("Command failed (exit 3): systemctl --user is-active")
+        def __call__(self, cmd, **kwargs):
+            raise CommandFailed("systemctl", 3, "Unit anubis@x.service not found")
 
     rc, out, err = _run(["restart"], runner=_Boom())
     assert rc == 1
     assert "Traceback" not in err
-    assert "Command failed (exit 3)" in err
+    assert "systemctl" in err
+    assert "exit 3" in err
+    assert "Unit anubis@x.service not found" in err
+
+
+def test_a_command_that_timed_out_prints_the_limit_it_passed():
+    class _Hangs(FakeRunner):
+        def __call__(self, cmd, **kwargs):
+            raise CommandTimeout("curl", 10.0, kwargs.get("what"))
+
+    rc, out, err = _run(["restart"], runner=_Hangs())
+    assert rc == 1
+    assert "Traceback" not in err
+    assert "timed out after 10s" in err
+
+
+def test_a_failed_enable_never_prints_the_generated_signing_key():
+    """The key is generated, then written as a heredoc body. A failure on the
+    way must not put it on the operator's terminal, in a CI log, or in a bug
+    report they paste it into."""
+    key = "5f0e" * 16
+    runner_that_fails_like_production = _FailsOn("cat >", _runner(**{
+        "openssl rand -hex 32": f"{key}\n",
+    }))
+
+    rc, out, err = _run(["enable", "example.com"], runner=runner_that_fails_like_production)
+
+    assert rc == 1
+    assert key not in out
+    assert key not in err
+
+
+class _FailsOn(FakeRunner):
+    """Answers like the given runner until a command matches, then fails as
+    SubprocessRunner would — same exception, command withheld."""
+
+    def __init__(self, needle: str, inner: FakeRunner):
+        super().__init__(inner.responses)
+        self._needle = needle
+
+    def __call__(self, cmd, **kwargs):
+        if self._needle in cmd:
+            raise CommandFailed(program_name(cmd), 1, "No such file or directory")
+        return super().__call__(cmd, **kwargs)
 
 
 def test_self_test():

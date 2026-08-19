@@ -28,7 +28,7 @@ from __future__ import annotations
 import posixpath
 import time
 
-from .runner import Runner
+from .runner import DEFAULT_TIMEOUT, Runner
 from .shell import heredoc, quote, quote_glob_prefix
 
 _SU_DELIMITER_PREFIX = "NINE_SU_EOF"
@@ -36,21 +36,44 @@ _FILE_DELIMITER_PREFIX = "FILE_EOF"
 _NOT_FOUND = "__NINE_SU_FILE_NOT_FOUND__"
 
 
-def nine_su(user: str, script: str, runner: Runner) -> str:
-    """Run a shell script as another user via nine-su heredoc."""
-    return runner(heredoc(f"sudo nine-su {quote(user)}", script, _SU_DELIMITER_PREFIX))
+def nine_su(
+    user: str,
+    script: str,
+    runner: Runner,
+    *,
+    timeout: float = DEFAULT_TIMEOUT,
+    what: str | None = None,
+) -> str:
+    """Run a shell script as another user via nine-su heredoc.
+
+    ``what`` names the operation for an error message. It is worth passing:
+    every command built here reports itself as ``nine-su``, which says nothing
+    about which of a dozen scripts is the one that failed or hung.
+    """
+    return runner(
+        heredoc(f"sudo nine-su {quote(user)}", script, _SU_DELIMITER_PREFIX),
+        timeout=timeout,
+        what=what,
+    )
 
 
-def nine_su_systemd(user: str, script: str, runner: Runner) -> str:
+def nine_su_systemd(
+    user: str,
+    script: str,
+    runner: Runner,
+    *,
+    timeout: float = DEFAULT_TIMEOUT,
+    what: str | None = None,
+) -> str:
     """Run a shell script as another user with XDG_RUNTIME_DIR set for systemctl --user."""
     full = f"export XDG_RUNTIME_DIR=/run/user/$(id -u)\n{script}"
-    return nine_su(user, full, runner)
+    return nine_su(user, full, runner, timeout=timeout, what=what)
 
 
 def nine_su_read_file(user: str, path: str, runner: Runner) -> str | None:
     """Read a file as another user. Returns None if the file doesn't exist."""
     script = f"cat -- {quote(path)} 2>/dev/null || echo {quote(_NOT_FOUND)}"
-    result = nine_su(user, script, runner)
+    result = nine_su(user, script, runner, what=f"reading {path}")
     # The sentinel is only ever printed on its own, so compare rather than
     # search: a file that happens to *contain* the sentinel is content, not a
     # missing file, and must not be able to make itself invisible.
@@ -83,13 +106,15 @@ def nine_su_write_file(
     ]
     if mode is not None:
         lines.append(f"chmod {quote(mode)} -- {quote(path)}")
-    nine_su(user, "\n".join(lines), runner)
+    # The path names the operation; the content never does. A key file's path
+    # is fine to print, its content is the thing this must not leak.
+    nine_su(user, "\n".join(lines), runner, what=f"writing {path}")
 
 
 def nine_su_file_exists(user: str, path: str, runner: Runner) -> bool:
     """Check if a file exists as another user."""
     script = f"test -f {quote(path)} && echo yes || echo no"
-    return nine_su(user, script, runner).strip() == "yes"
+    return nine_su(user, script, runner, what=f"checking {path}").strip() == "yes"
 
 
 def nine_su_glob_prefix(user: str, prefix: str, runner: Runner) -> list[str]:
@@ -100,7 +125,7 @@ def nine_su_glob_prefix(user: str, prefix: str, runner: Runner) -> list[str]:
     matches itself instead of widening the listing.
     """
     script = f"ls -1d -- {quote_glob_prefix(prefix)} 2>/dev/null || true"
-    result = nine_su(user, script, runner)
+    result = nine_su(user, script, runner, what=f"listing {prefix}*")
     return [line.strip() for line in result.strip().splitlines() if line.strip()]
 
 
@@ -111,13 +136,13 @@ def nine_su_backup(user: str, path: str, runner: Runner) -> str | None:
         f"cp -p -- {quote(path)} {quote(backup)} 2>/dev/null "
         f"&& printf '%s\\n' {quote(backup)} || true"
     )
-    result = nine_su(user, script, runner).strip()
+    result = nine_su(user, script, runner, what=f"backing up {path}").strip()
     return result if result else None
 
 
 def nine_su_unlink(user: str, path: str, runner: Runner) -> None:
     """Remove a file as another user."""
-    nine_su(user, f"rm -f -- {quote(path)}", runner)
+    nine_su(user, f"rm -f -- {quote(path)}", runner, what=f"removing {path}")
 
 
 def mkdir_parent(path: str) -> str:

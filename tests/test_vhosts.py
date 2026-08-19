@@ -21,6 +21,9 @@ from nine_manage_anubis.vhosts import (
     remove_user,
     list_users,
     user_exists,
+    webserver_reload,
+    CERTIFICATE_TIMEOUT,
+    VHOST_TIMEOUT,
     PROXY_TEMPLATE,
     ORIGIN_TEMPLATE,
     DEFAULT_LE_TEMPLATE,
@@ -299,3 +302,38 @@ def test_no_notify_stays_a_flag():
     r = FakeRunner()
     create_vhost("example.com", "www-example", no_notify=True, runner=r)
     assert "--no-notify-services" in argv(r.calls[0])
+
+
+# --- Timeouts -----------------------------------------------------------------
+#
+# A vhost change reloads Apache and a certificate request talks to Let's
+# Encrypt, so both are slower than an ordinary command — but neither may run
+# without a limit.
+
+
+@pytest.mark.parametrize(
+    "call,args",
+    [
+        (create_vhost, ("example.com", "www-example")),
+        (update_vhost, ("example.com",)),
+        (remove_vhost, ("example.com",)),
+        (webserver_reload, ()),
+    ],
+)
+def test_a_vhost_change_runs_under_the_vhost_timeout(call, args):
+    r = FakeRunner()
+    call(*args, runner=r)
+    assert r.invocations[0].timeout == VHOST_TIMEOUT
+
+
+def test_a_certificate_request_gets_longer_and_names_the_domain():
+    r = FakeRunner()
+    create_certificate("example.com", runner=r)
+    assert r.invocations[0].timeout == CERTIFICATE_TIMEOUT
+    assert "example.com" in r.invocations[0].what
+
+
+def test_a_read_only_query_names_what_it_was_reading():
+    r = FakeRunner({"sudo nine-manage-vhosts user list --json": "[]"})
+    list_users(r)
+    assert r.invocations[0].what

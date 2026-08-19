@@ -64,7 +64,9 @@ class PortAllocation:
 
 def _parse_vhosts_json(runner: Runner) -> list[dict]:
     """Read the vhost list, validating every field we later interpolate."""
-    raw = runner("sudo nine-manage-vhosts virtual-host list --json")
+    raw = runner(
+        "sudo nine-manage-vhosts virtual-host list --json", what="listing vhosts"
+    )
     vhosts = json.loads(raw)
     if not isinstance(vhosts, list):
         raise ValidationError(
@@ -135,7 +137,7 @@ def _parse_ss_output(ss_output: str) -> set[int]:
 
 
 def get_listening_ports(runner: Runner = SubprocessRunner()) -> set[int]:
-    return _parse_ss_output(runner("ss -tlnp"))
+    return _parse_ss_output(runner("ss -tlnp", what="listing listening ports"))
 
 
 # --- Env file scanning --------------------------------------------------------
@@ -154,7 +156,9 @@ def _parse_env_file(content: str) -> dict[str, str]:
 
 
 def _find_anubis_users(runner: Runner) -> list[str]:
-    output = runner("ls -d /home/www-*/ 2>/dev/null")
+    output = runner(
+        "ls -d /home/www-*/ 2>/dev/null", what="listing home directories"
+    )
     users = []
     for line in output.strip().splitlines():
         path = line.strip().rstrip("/")
@@ -169,7 +173,8 @@ def _find_anubis_users(runner: Runner) -> list[str]:
         except ValidationError:
             continue
         check = runner(
-            f"test -d {quote(f'/home/{user}/.config/anubis')} && echo yes || echo no"
+            f"test -d {quote(f'/home/{user}/.config/anubis')} && echo yes || echo no",
+            what=f"checking for an Anubis config directory under /home/{user}",
         )
         if check.strip() == "yes":
             users.append(user)
@@ -185,6 +190,7 @@ def get_claimed_ports(runner: Runner = SubprocessRunner()) -> dict[int, tuple[st
             user,
             "ls ~/.config/anubis/*.env 2>/dev/null",
             runner,
+            what=f"listing the env files of {user}",
         )
         for env_path in listing.strip().splitlines():
             env_path = env_path.strip()

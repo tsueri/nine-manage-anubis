@@ -16,30 +16,55 @@ breaks out here, and the test sees it.
 import re
 import subprocess
 
+from nine_manage_anubis.runner import (
+    DEFAULT_TIMEOUT,
+    CommandFailed,
+    CommandTimeout,
+    program_name,
+)
+
 # `sudo nine-su <user> ` — the user is one shell word, quoted or not.
 _SU = re.compile(r"^sudo nine-su (?:[^\s']+|'(?:[^']|'\\'')*') ")
 
 
 class ShellRunner:
-    """Runs commands for real. ``sudo``/``nine-su`` are dropped, nothing else."""
+    """Runs commands for real. ``sudo``/``nine-su`` are dropped, nothing else.
+
+    Reports a *failure* the way :class:`~nine_manage_anubis.runner.SubprocessRunner`
+    reports one — same exception, same message, command withheld — so a test can
+    ask what an operator would have been told about a write that really went
+    wrong. Only that much is shared: the timeout here is subprocess's own, with
+    no process-group kill behind it, because nothing in these tests hangs.
+
+    It also keeps stderr on success, which SubprocessRunner has no reason to,
+    because a body that escapes its heredoc shows up there while the command
+    still exits 0.
+    """
 
     def __init__(self) -> None:
         self.stderr: list[str] = []
 
-    def __call__(self, cmd: str) -> str:
+    def __call__(
+        self,
+        cmd: str,
+        *,
+        timeout: float = DEFAULT_TIMEOUT,
+        what: str | None = None,
+    ) -> str:
         assert _SU.match(cmd), f"not a nine-su command: {cmd!r}"
-        proc = subprocess.run(
-            _SU.sub("/bin/sh ", cmd, count=1),
-            shell=True,
-            capture_output=True,
-            text=True,
-        )
+        try:
+            proc = subprocess.run(
+                _SU.sub("/bin/sh ", cmd, count=1),
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired:
+            raise CommandTimeout(program_name(cmd), timeout, what) from None
         self.stderr.append(proc.stderr)
         if proc.returncode != 0:
-            raise RuntimeError(
-                f"Command failed (exit {proc.returncode}): {cmd}\n"
-                f"stderr: {proc.stderr}"
-            )
+            raise CommandFailed(program_name(cmd), proc.returncode, proc.stderr, what)
         return proc.stdout
 
     def ran_nothing_unexpected(self) -> bool:

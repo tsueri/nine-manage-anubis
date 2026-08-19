@@ -28,6 +28,24 @@ from .nine_su import (
 from .shell import quote
 from .validate import validate_version
 
+# A unit change waits for the unit: systemd gives a service 90s to start or
+# stop before giving up on it, so anything shorter would report a timeout for
+# a service that is merely slow.
+SERVICE_TIMEOUT = 120.0
+
+# A release tarball is tens of megabytes, so a slow link is not a stalled one.
+DOWNLOAD_TIMEOUT = 300.0
+
+# curl gets a limit of its own because this is the one command that runs as
+# another user through nine-su, where our kill can be refused — its own clock
+# cannot be. A minute short of ours, so a stall is reported by the far side as
+# a clean failure while we are still listening, rather than by us as a process
+# we abandoned.
+_DOWNLOAD_MAX_TIME = int(DOWNLOAD_TIMEOUT) - 60
+
+# One small JSON document from an API that is either up or not.
+RELEASE_QUERY_TIMEOUT = 30.0
+
 
 def _unit(instance: str) -> str:
     """The systemd unit name for an instance, as a single shell word."""
@@ -35,7 +53,12 @@ def _unit(instance: str) -> str:
 
 
 def daemon_reload(user: str, runner: Runner = SubprocessRunner()) -> str:
-    return nine_su_systemd(user, "systemctl --user daemon-reload", runner)
+    return nine_su_systemd(
+        user,
+        "systemctl --user daemon-reload",
+        runner,
+        what=f"reloading the systemd user daemon for {user}",
+    )
 
 
 def enable_service(user: str, instance: str, runner: Runner = SubprocessRunner()) -> str:
@@ -43,6 +66,8 @@ def enable_service(user: str, instance: str, runner: Runner = SubprocessRunner()
         user,
         f"systemctl --user enable --now {_unit(instance)}",
         runner,
+        timeout=SERVICE_TIMEOUT,
+        what=f"starting anubis@{instance}.service",
     )
 
 
@@ -51,6 +76,8 @@ def disable_service(user: str, instance: str, runner: Runner = SubprocessRunner(
         user,
         f"systemctl --user disable --now {_unit(instance)}",
         runner,
+        timeout=SERVICE_TIMEOUT,
+        what=f"stopping anubis@{instance}.service",
     )
 
 
@@ -59,6 +86,8 @@ def restart_service(user: str, instance: str, runner: Runner = SubprocessRunner(
         user,
         f"systemctl --user restart {_unit(instance)}",
         runner,
+        timeout=SERVICE_TIMEOUT,
+        what=f"restarting anubis@{instance}.service",
     )
 
 
@@ -70,6 +99,7 @@ def is_active(user: str, instance: str, runner: Runner = SubprocessRunner()) -> 
         user,
         f"systemctl --user is-active {_unit(instance)} || true",
         runner,
+        what=f"querying anubis@{instance}.service",
     )
     return result.strip()
 
@@ -109,17 +139,21 @@ def file_exists(user: str, path: str, runner: Runner = SubprocessRunner()) -> bo
 
 def generate_key(runner: Runner = SubprocessRunner()) -> str:
     """Generate a JWT signing key via openssl."""
-    return runner("openssl rand -hex 32").strip()
+    return runner("openssl rand -hex 32", what="generating a signing key").strip()
 
 
 def binary_exists(user: str, runner: Runner = SubprocessRunner()) -> bool:
     script = f"test -f {quote(f'/home/{user}/bin/anubis')} && echo yes || echo no"
-    return nine_su(user, script, runner).strip() == "yes"
+    return nine_su(
+        user, script, runner, what=f"checking for the Anubis binary of {user}"
+    ).strip() == "yes"
 
 
 def binary_version(user: str, runner: Runner = SubprocessRunner()) -> str:
     script = f"{quote(f'/home/{user}/bin/anubis')} --version 2>&1 || true"
-    return nine_su(user, script, runner).strip()
+    return nine_su(
+        user, script, runner, what=f"reading the Anubis version of {user}"
+    ).strip()
 
 
 def download_binary(user: str, version: str, runner: Runner = SubprocessRunner()) -> str:
@@ -130,7 +164,7 @@ def download_binary(user: str, version: str, runner: Runner = SubprocessRunner()
     script = "\n".join(
         [
             "cd /tmp",
-            f"curl -sLO {quote(url)}",
+            f"curl -sLO --max-time {_DOWNLOAD_MAX_TIME} {quote(url)}",
             f"tar xzf {quote(tarball)}",
             "mkdir -p ~/bin",
             f"cp {quote(f'{unpacked}/bin/anubis')} ~/bin/",
@@ -140,14 +174,27 @@ def download_binary(user: str, version: str, runner: Runner = SubprocessRunner()
             "~/bin/anubis --version",
         ]
     )
-    return nine_su(user, script, runner)
+    return nine_su(
+        user,
+        script,
+        runner,
+        timeout=DOWNLOAD_TIMEOUT,
+        what=f"downloading Anubis v{version}",
+    )
 
 
 def get_latest_version(runner: Runner = SubprocessRunner()) -> str:
-    """Fetch the latest Anubis release version from GitHub API."""
+    """Fetch the latest Anubis release version from GitHub API.
+
+    One program, no pipeline: a pipeline exits with its *last* command's status,
+    so `curl | grep` reported "curl failed (exit 1)" whenever it was grep that
+    found nothing — naming the wrong program for the most likely failure. The
+    grep was a second copy of the parse below in any case.
+    """
     raw = runner(
-        "curl -sL https://api.github.com/repos/TecharoHQ/anubis/releases/latest "
-        "| grep -m1 '\"tag_name\"'"
+        "curl -sL https://api.github.com/repos/TecharoHQ/anubis/releases/latest",
+        timeout=RELEASE_QUERY_TIMEOUT,
+        what="fetching the latest Anubis version from GitHub",
     )
     # Parse "tag_name": "v1.27.0" from the grep output. The response is
     # untrusted network data and the version lands in a download URL and a
@@ -171,4 +218,6 @@ def extract_policy(user: str, dest_path: str, runner: Runner = SubprocessRunner(
             f"rm -rf -- {quote(scratch)}",
         ]
     )
-    return nine_su(user, script, runner)
+    return nine_su(
+        user, script, runner, what=f"extracting the default bot policy to {dest_path}"
+    )

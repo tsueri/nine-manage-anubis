@@ -17,6 +17,15 @@ import re
 from .runner import Runner, SubprocessRunner
 from .shell import quote
 
+# A vhost change rewrites Apache config and notifies the webserver, so it is
+# slower than a query but not slow in the way the network is.
+VHOST_TIMEOUT = 120.0
+
+# Issuing a certificate means an ACME round trip with Let's Encrypt, including
+# a challenge Apache has to serve. Generous on purpose: a timeout here aborts
+# an enable and rolls it back, so a slow CA must not look like a broken one.
+CERTIFICATE_TIMEOUT = 300.0
+
 # --- Templates ----------------------------------------------------------------
 
 PROXY_TEMPLATE = "proxy_letsencrypt_https_redirect"
@@ -63,7 +72,9 @@ def create_vhost(
     parts.extend(_template_variable_options(template_variables))
     if no_notify:
         parts.append("--no-notify-services")
-    return runner(" ".join(parts))
+    return runner(
+        " ".join(parts), timeout=VHOST_TIMEOUT, what=f"creating vhost {domain}"
+    )
 
 
 def update_vhost(
@@ -79,7 +90,9 @@ def update_vhost(
     parts.extend(_template_variable_options(template_variables))
     if no_notify:
         parts.append("--no-notify-services")
-    return runner(" ".join(parts))
+    return runner(
+        " ".join(parts), timeout=VHOST_TIMEOUT, what=f"updating vhost {domain}"
+    )
 
 
 def remove_vhost(
@@ -90,11 +103,15 @@ def remove_vhost(
     cmd = f"sudo nine-manage-vhosts virtual-host remove {quote(domain)}"
     if no_notify:
         cmd += " --no-notify-services"
-    return runner(cmd)
+    return runner(cmd, timeout=VHOST_TIMEOUT, what=f"removing vhost {domain}")
 
 
 def webserver_reload(runner: Runner = SubprocessRunner()) -> str:
-    return runner("sudo nine-manage-vhosts webserver reload")
+    return runner(
+        "sudo nine-manage-vhosts webserver reload",
+        timeout=VHOST_TIMEOUT,
+        what="reloading the webserver",
+    )
 
 
 def create_origin_vhost(
@@ -164,7 +181,9 @@ _CERT_RE = re.compile(r"DOMAIN:\s+(\S+)\s+VALID UNTIL:\s+(\d{4}-\d{2}-\d{2})")
 
 def list_certificates(runner: Runner = SubprocessRunner()) -> dict[str, str]:
     """Parse `certificate list` text output. Returns {domain: expiry_date}."""
-    raw = runner("sudo nine-manage-vhosts certificate list")
+    raw = runner(
+        "sudo nine-manage-vhosts certificate list", what="listing certificates"
+    )
     certs = {}
     for m in _CERT_RE.finditer(raw):
         certs[m.group(1)] = m.group(2)
@@ -177,13 +196,17 @@ def certificate_exists(domain: str, runner: Runner = SubprocessRunner()) -> bool
 
 def create_certificate(domain: str, runner: Runner = SubprocessRunner()) -> str:
     return runner(
-        f"sudo nine-manage-vhosts certificate create --virtual-host={quote(domain)}"
+        f"sudo nine-manage-vhosts certificate create --virtual-host={quote(domain)}",
+        timeout=CERTIFICATE_TIMEOUT,
+        what=f"requesting a certificate for {domain}",
     )
 
 
 def remove_certificate(domain: str, runner: Runner = SubprocessRunner()) -> str:
     return runner(
-        f"sudo nine-manage-vhosts certificate remove --virtual-host={quote(domain)}"
+        f"sudo nine-manage-vhosts certificate remove --virtual-host={quote(domain)}",
+        timeout=CERTIFICATE_TIMEOUT,
+        what=f"removing the certificate for {domain}",
     )
 
 
@@ -192,7 +215,7 @@ def remove_certificate(domain: str, runner: Runner = SubprocessRunner()) -> str:
 
 def list_users(runner: Runner = SubprocessRunner()) -> list[dict]:
     import json
-    raw = runner("sudo nine-manage-vhosts user list --json")
+    raw = runner("sudo nine-manage-vhosts user list --json", what="listing users")
     return json.loads(raw)
 
 
@@ -203,9 +226,13 @@ def user_exists(name: str, runner: Runner = SubprocessRunner()) -> bool:
 
 def create_user(name: str, runner: Runner = SubprocessRunner()) -> str:
     return runner(
-        f"sudo nine-manage-vhosts user create {quote(name)} --no-password"
+        f"sudo nine-manage-vhosts user create {quote(name)} --no-password",
+        what=f"creating user {name}",
     )
 
 
 def remove_user(name: str, runner: Runner = SubprocessRunner()) -> str:
-    return runner(f"sudo nine-manage-vhosts user remove {quote(name)}")
+    return runner(
+        f"sudo nine-manage-vhosts user remove {quote(name)}",
+        what=f"removing user {name}",
+    )
