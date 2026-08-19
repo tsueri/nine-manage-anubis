@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from .runner import CommandTimeout, Runner, SubprocessRunner
+from .runner import CommandFailed, CommandTimeout, Runner, SubprocessRunner
 from .ports import (
     AnubisInstance,
     allocate_for_domain,
@@ -56,9 +56,12 @@ from .systemd import (
     extract_policy,
 )
 from .fixups import apply as apply_fixups, restore as restore_fixups
+from .settings import Settings
 from .fileops import RemoteFileOps
 from .shell import quote
 from .validate import (
+    ValidationError,
+    required_vhost_field,
     validate_domain,
     validate_path,
     validate_system_user,
@@ -66,8 +69,11 @@ from .validate import (
 )
 
 
-DEFAULT_ANUBIS_USER = "www-anubis"
-ANUBIS_VERSION = "1.27.0"
+# The defaults live on the Settings dataclass — the same values the config
+# file falls back to — so driving the library directly and driving it through
+# the CLI cannot disagree about which user or version is meant.
+DEFAULT_ANUBIS_USER = Settings.anubis_user
+ANUBIS_VERSION = Settings.anubis_version
 
 # A healthy instance answers a loopback probe in milliseconds, so this bounds
 # the case the limit exists for: an instance wedged badly enough to accept the
@@ -129,6 +135,55 @@ def _probe_timed_out(domain: str) -> str:
     return f"anubis@{domain}.service HTTP probe {PROBE_TIMED_OUT}"
 
 
+# What a probe that could not be made at all is called, wherever it is
+# reported — connection refused, DNS failure, no curl. Same reason as the
+# phrase above: one wording, so two commands cannot describe it differently.
+PROBE_FAILED = "probe failed"
+
+
+def _probe_failed(domain: str, exc: Exception) -> str:
+    """The warning for a probe that could not be made at all.
+
+    The probe never reached the instance, so nothing is known about it —
+    which is a failed health check, not a check that did not apply.
+    """
+    return f"anubis@{domain}.service HTTP {PROBE_FAILED}: {exc}"
+
+
+# A probe answers with the status code of an HTTP response, or with 000 when
+# curl never got one. 2xx and 3xx are Anubis serving or challenging; 4xx and
+# 5xx are the instance answering with its own failure.
+HEALTHY_STATUS = range(200, 400)
+NO_RESPONSE_STATUS = 0
+
+
+def _status_code(raw: str) -> int | None:
+    """The probe's answer as a number, or None if it was not one.
+
+    A status code is a number and is compared as one. Reading it as text —
+    "does it start with a 2 or a 3" — makes the verdict depend on the shape
+    of what curl printed rather than on the code it stands for.
+    """
+    try:
+        return int(raw.strip())
+    except ValueError:
+        return None
+
+
+def _probe_answer(raw: str) -> str:
+    """How a probe's answer reads in a message.
+
+    ``000`` is curl reporting that it never got a response, so it is not
+    reported as an HTTP status: "HTTP 000" reads like the instance answered.
+    """
+    code = _status_code(raw)
+    if code is None:
+        return f"unreadable answer {raw!r}"
+    if code == NO_RESPONSE_STATUS:
+        return "no response"
+    return f"HTTP {code}"
+
+
 @dataclass
 class CommandResult:
     steps: list[str] = field(default_factory=list)
@@ -138,6 +193,97 @@ class CommandResult:
     @property
     def success(self) -> bool:
         return self.error is None
+
+
+# --- Rolling restart ----------------------------------------------------------
+#
+# `upgrade` and `restart` both restart every instance one at a time, checking
+# each before touching the next. One implementation, because the check is the
+# whole point of restarting them one at a time: a version of it that passes
+# where the other fails would let a bad rollout continue.
+
+
+@dataclass
+class HealthVerdict:
+    """What one health check found.
+
+    ``detail`` is the whole story, as a warning tells it ("HTTP probe timed
+    out after 10s"); ``reason`` is the short phrase an error names it by
+    ("probe timed out"). Deciding and reporting are separate so that every
+    way of *not knowing* an instance is healthy comes back as a verdict
+    rather than as a caller's guess: a check that could not be made is not
+    a check that passed, and treating it as one carries the fault to the
+    next instance — the failure a rolling restart exists to prevent.
+    """
+
+    ok: bool
+    detail: str
+    reason: str = ""
+
+
+def _health_verdict(
+    anubis_user: str, inst: AnubisInstance, runner: Runner
+) -> HealthVerdict:
+    """Is the instance up and answering, and if not, what happened?"""
+    state = is_active(anubis_user, inst.domain, runner=runner)
+    if state != "active":
+        return HealthVerdict(
+            False, f"is {state} after restart", "service not active"
+        )
+
+    try:
+        raw = _http_probe(inst.domain, inst.port, runner)
+    except CommandTimeout:
+        # A probe that never answered is the wedged instance a rolling
+        # restart exists to catch, not a probe to shrug at.
+        return HealthVerdict(
+            False, f"HTTP probe {PROBE_TIMED_OUT}", "probe timed out"
+        )
+    except CommandFailed as e:
+        return HealthVerdict(False, f"HTTP {PROBE_FAILED}: {e}", PROBE_FAILED)
+
+    answer = _probe_answer(raw)
+    if _status_code(raw) not in HEALTHY_STATUS:
+        return HealthVerdict(False, f"HTTP probe returned {answer}", answer)
+    return HealthVerdict(True, answer)
+
+
+def _restart_one(
+    anubis_user: str, inst: AnubisInstance, runner: Runner, result: CommandResult
+) -> None:
+    """Restart one instance and say so — the step both restart modes share."""
+    restart_service(anubis_user, inst.domain, runner=runner)
+    result.steps.append(f"Restarted anubis@{inst.domain}.service")
+
+
+def _rolling_restart(
+    anubis_user: str,
+    instances: list[AnubisInstance],
+    runner: Runner,
+    result: CommandResult,
+) -> None:
+    """Restart each instance, stopping at the first that fails its check."""
+    for inst in instances:
+        _restart_one(anubis_user, inst, runner, result)
+        verdict = _health_verdict(anubis_user, inst, runner)
+        if not verdict.ok:
+            result.warnings.append(
+                f"anubis@{inst.domain}.service {verdict.detail} — stopping"
+            )
+            result.error = f"Health check failed for {inst.domain} ({verdict.reason})"
+            return
+        result.steps.append(f"  Health check: active ({verdict.detail})")
+
+
+def _restart_all_at_once(
+    anubis_user: str,
+    instances: list[AnubisInstance],
+    runner: Runner,
+    result: CommandResult,
+) -> None:
+    """Restart every instance without checking — what --no-rolling asks for."""
+    for inst in instances:
+        _restart_one(anubis_user, inst, runner, result)
 
 
 # --- install ------------------------------------------------------------------
@@ -271,12 +417,20 @@ def cmd_enable(
         result.error = f"Vhost {domain} not found"
         return result
 
-    webroot = vh["webroot"]
-    website_user = vh["user"]
+    # Read every field this command needs before it does anything, so an
+    # incomplete record is a message rather than a KeyError partway through.
+    try:
+        webroot = required_vhost_field(vh, "webroot")
+        website_user = required_vhost_field(vh, "user")
+        template = required_vhost_field(vh, "template")
+    except ValidationError as e:
+        result.error = str(e)
+        return result
+
     tv = vh.get("template_variables", {})
     php_version = tv.get("PHP_VERSION")
 
-    if vh["template"] == PROXY_TEMPLATE:
+    if template == PROXY_TEMPLATE:
         result.error = f"{domain} is already behind Anubis"
         return result
 
@@ -409,8 +563,25 @@ def cmd_disable(
         result.error = f"Vhost {domain} not found"
         return result
 
-    if vh["template"] != PROXY_TEMPLATE:
-        result.error = f"{domain} is not behind Anubis (template is {vh['template']})"
+    try:
+        template = required_vhost_field(vh, "template")
+    except ValidationError as e:
+        result.error = str(e)
+        return result
+
+    if template != PROXY_TEMPLATE:
+        result.error = f"{domain} is not behind Anubis (template is {template})"
+        return result
+
+    # The webroot and the user are only needed to tear the instance down, but
+    # they are read here anyway: a disable that switched the template and then
+    # discovered it could not finish would leave the vhost unprotected and the
+    # instance still running.
+    try:
+        webroot = required_vhost_field(vh, "webroot")
+        website_user = required_vhost_field(vh, "user")
+    except ValidationError as e:
+        result.error = str(e)
         return result
 
     tv = vh.get("template_variables", {})
@@ -447,8 +618,8 @@ def cmd_disable(
         remove_origin_vhost(domain, no_notify=no_notify, runner=runner)
         result.steps.append(f"Removed origin vhost origin-{domain}")
 
-        ops = RemoteFileOps(vh["user"], runner)
-        restore_fixups(vh["webroot"], ops, dry_run=False)
+        ops = RemoteFileOps(website_user, runner)
+        restore_fixups(webroot, ops, dry_run=False)
         result.steps.append("Restored fixup files")
 
         env_path = env_path_for(anubis_user, domain)
@@ -505,36 +676,9 @@ def cmd_upgrade(
         return result
 
     if no_rolling:
-        for inst in instances:
-            restart_service(anubis_user, inst.domain, runner=runner)
-            result.steps.append(f"Restarted anubis@{inst.domain}.service")
+        _restart_all_at_once(anubis_user, instances, runner, result)
     else:
-        for inst in instances:
-            restart_service(anubis_user, inst.domain, runner=runner)
-            result.steps.append(f"Restarted anubis@{inst.domain}.service")
-            state = is_active(anubis_user, inst.domain, runner=runner)
-            if state != "active":
-                result.warnings.append(
-                    f"anubis@{inst.domain}.service is {state} after restart — stopping upgrade"
-                )
-                result.error = f"Health check failed for {inst.domain} (service not active)"
-                return result
-            try:
-                code = _http_probe(inst.domain, inst.port, runner)
-                if code and code[0] in "23":
-                    result.steps.append(f"  Health check: active (HTTP {code})")
-                else:
-                    result.warnings.append(f"anubis@{inst.domain}.service HTTP probe returned {code}")
-                    result.error = f"Health check failed for {inst.domain} (HTTP {code})"
-                    return result
-            except CommandTimeout:
-                # A probe that never answered is the wedged instance a rolling
-                # restart exists to catch, not a probe to shrug at.
-                result.warnings.append(_probe_timed_out(inst.domain))
-                result.error = f"Health check failed for {inst.domain} (probe timed out)"
-                return result
-            except Exception:
-                result.steps.append(f"  Health check: active (service, HTTP probe skipped)")
+        _rolling_restart(anubis_user, instances, runner, result)
 
     return result
 
@@ -560,12 +704,13 @@ def cmd_status(
         for inst in instances:
             if inst.is_running:
                 try:
-                    code = _http_probe(inst.domain, inst.port, runner)
-                    health_map[inst.domain] = f"HTTP {code}" if code else "no response"
+                    health_map[inst.domain] = _probe_answer(
+                        _http_probe(inst.domain, inst.port, runner)
+                    )
                 except CommandTimeout:
                     health_map[inst.domain] = PROBE_TIMED_OUT
-                except Exception:
-                    health_map[inst.domain] = "error"
+                except CommandFailed as e:
+                    health_map[inst.domain] = f"{PROBE_FAILED} (exit {e.returncode})"
             else:
                 health_map[inst.domain] = "inactive"
 
@@ -621,23 +766,25 @@ def cmd_selftest(
                 f"anubis@{inst.domain}.service is not active (state: {inst.service_state})")
             continue
         result.steps.append(f"anubis@{inst.domain}.service: active")
+        # Any answer at all means Anubis is listening, so self-test reports a
+        # 502 as a pass where a rolling restart would stop: it is describing
+        # the box, not deciding whether to touch the next instance.
         try:
-            code_str = _http_probe(inst.domain, inst.port, runner)
-            try:
-                code = int(code_str)
-                ok = code > 0
-            except ValueError:
-                code = code_str
-                ok = False
-            if ok:
-                result.steps.append(f"  HTTP probe: {code}")
-            else:
-                result.warnings.append(
-                    f"anubis@{inst.domain}.service HTTP probe returned {code}")
+            raw = _http_probe(inst.domain, inst.port, runner)
         except CommandTimeout:
             result.warnings.append(_probe_timed_out(inst.domain))
-        except Exception:
-            result.warnings.append(f"anubis@{inst.domain}.service HTTP probe failed")
+            continue
+        except CommandFailed as e:
+            result.warnings.append(_probe_failed(inst.domain, e))
+            continue
+        code = _status_code(raw)
+        if code is None or code == NO_RESPONSE_STATUS:
+            result.warnings.append(
+                f"anubis@{inst.domain}.service HTTP probe returned "
+                f"{_probe_answer(raw)}"
+            )
+        else:
+            result.steps.append(f"  HTTP probe: {code}")
 
     if result.warnings:
         result.error = f"{len(result.warnings)} check(s) failed"
@@ -673,35 +820,8 @@ def cmd_restart(
         return result
 
     if no_rolling:
-        for inst in instances:
-            restart_service(anubis_user, inst.domain, runner=runner)
-            result.steps.append(f"Restarted anubis@{inst.domain}.service")
+        _restart_all_at_once(anubis_user, instances, runner, result)
     else:
-        for inst in instances:
-            restart_service(anubis_user, inst.domain, runner=runner)
-            result.steps.append(f"Restarted anubis@{inst.domain}.service")
-            state = is_active(anubis_user, inst.domain, runner=runner)
-            if state != "active":
-                result.warnings.append(
-                    f"anubis@{inst.domain}.service is {state} after restart — stopping"
-                )
-                result.error = f"Health check failed for {inst.domain} (service not active)"
-                return result
-            try:
-                code = _http_probe(inst.domain, inst.port, runner)
-                if code and code[0] in "23":
-                    result.steps.append(f"  Health check: active (HTTP {code})")
-                else:
-                    result.warnings.append(
-                        f"anubis@{inst.domain}.service HTTP probe returned {code}"
-                    )
-                    result.error = f"Health check failed for {inst.domain} (HTTP {code})"
-                    return result
-            except CommandTimeout:
-                result.warnings.append(_probe_timed_out(inst.domain))
-                result.error = f"Health check failed for {inst.domain} (probe timed out)"
-                return result
-            except Exception:
-                result.steps.append(f"  Health check: active (service, HTTP probe skipped)")
+        _rolling_restart(anubis_user, instances, runner, result)
 
     return result

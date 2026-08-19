@@ -68,19 +68,42 @@ PREPEND_RE = re.compile(
     re.MULTILINE,
 )
 
-SAFETY_TOKENS = (
-    "HTTP_X_FORWARDED_HOST",
-    "%{HTTP:X-Forwarded-Host}",
-)
+# The tokens that make each fixup conditional on the request having come
+# through Anubis. Named, because losing one is the failure _verify_safety
+# exists to catch.
+SHIM_GUARD = "HTTP_X_FORWARDED_HOST"
+HTACCESS_GUARD = "%{HTTP:X-Forwarded-Host}"
+
+
+class SafetyCheckFailed(RuntimeError):
+    """A fixup template lost the guard that makes it a no-op off Anubis.
+
+    Subclasses RuntimeError, so the CLI turns it into a one-line error and
+    exit 1 rather than a traceback.
+    """
 
 
 def _verify_safety() -> None:
-    assert SAFETY_TOKENS[0] in SHIM_PHP, (
-        "anubis-origin-shim.php lost its X-Forwarded-Host guard"
-    )
-    assert SAFETY_TOKENS[1] in HTACCESS_BLOCK, (
-        ".htaccess block lost its X-Forwarded-Host RewriteCond"
-    )
+    """Refuse to install fixups whose X-Forwarded-Host guard has drifted.
+
+    Written as a raise and not an ``assert``: ``python -O`` strips asserts,
+    and this check is the reason the fixups are safe to drop into a webroot
+    shared with vhosts that are *not* behind Anubis. Compiled out, a drifted
+    template would rewrite the Host header — or emit a redirect — for every
+    one of those siblings.
+    """
+    if SHIM_GUARD not in SHIM_PHP:
+        raise SafetyCheckFailed(
+            f"anubis-origin-shim.php lost its {SHIM_GUARD} guard — "
+            f"refusing to install fixups that would also apply to vhosts "
+            f"not behind Anubis"
+        )
+    if HTACCESS_GUARD not in HTACCESS_BLOCK:
+        raise SafetyCheckFailed(
+            f".htaccess block lost its {HTACCESS_GUARD} RewriteCond — "
+            f"refusing to install fixups that would also apply to vhosts "
+            f"not behind Anubis"
+        )
 
 
 # --- State -------------------------------------------------------------------

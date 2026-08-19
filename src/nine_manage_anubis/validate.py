@@ -174,6 +174,26 @@ def validate_filename(value: object, field: str = "file name") -> str:
     return value
 
 
+def required_vhost_field(vhost: dict, key: str, field: str = "vhost") -> str:
+    """The value of a vhost field a command cannot be built without.
+
+    ``nine-manage-vhosts`` reports the webroot, the owning user and the
+    template, and each of them ends up in a further command. Indexing the
+    dict for one turns an unexpected shape — a vhost type we have not seen,
+    or an upstream change to the JSON — into a bare ``KeyError``, which names
+    neither the vhost it came from nor what the tool wanted from it.
+    """
+    value = vhost.get(key)
+    if not isinstance(value, str):
+        name = vhost.get("domain", "(unnamed)")
+        reported = "no" if value is None else f"a {type(value).__name__} for"
+        raise ValidationError(
+            f"Incomplete {field} record for {name}: nine-manage-vhosts "
+            f"reported {reported} {key!r}."
+        )
+    return value
+
+
 def validate_vhost_record(vhost: object, field: str = "vhost") -> dict:
     """Validate every field of a ``nine-manage-vhosts`` JSON record we use.
 

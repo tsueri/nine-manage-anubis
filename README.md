@@ -46,7 +46,7 @@ chmod +x ~/bin/nine-manage-anubis
 
 ## Configuration
 
-The CLI reads defaults from a JSON config file at `~/.config/nine-manage-anubis/config.json`. All fields are optional — missing fields use hardcoded defaults.
+The CLI reads defaults from a JSON config file at `~/.config/nine-manage-anubis/config.json`. All fields are optional — a missing field, or one set to `null`, uses the default. A file that cannot be read or parsed is reported and the run continues on defaults; a file that parses but carries a malformed value is rejected and the run stops.
 
 ```json
 {

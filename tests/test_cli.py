@@ -495,7 +495,7 @@ def test_settings_provide_defaults(tmp_path, monkeypatch):
         "policy_file": "/home/www-data/.config/anubis/policy.yaml",
     }))
     monkeypatch.setattr(settings_mod, "default_config_path", lambda: config)
-    settings = settings_mod.load_settings()
+    settings = settings_mod.load_settings().settings
     assert settings.anubis_user == "www-data"
     assert settings.anubis_version == "1.30.0"
     assert settings.policy_file == "/home/www-data/.config/anubis/policy.yaml"
@@ -723,4 +723,54 @@ def test_config_init_overwrites_a_rejected_config_file(tmp_path, monkeypatch):
     assert rc == 0
     # The file it wrote is now loadable.
     from nine_manage_anubis.settings import load_settings
-    assert load_settings(config).anubis_user == "www-anubis"
+    assert load_settings(config).settings.anubis_user == "www-anubis"
+
+
+# --- A config file that could not be read ------------------------------------
+#
+# Unlike a rejected value, a file that does not parse is not fatal: the
+# defaults are good ones and the run proceeds. It just does not proceed
+# quietly, because the operator wrote that file expecting it to be in effect.
+
+
+def _with_config(monkeypatch, tmp_path, content: str):
+    config = tmp_path / "config.json"
+    config.write_text(content)
+    for target in (
+        "nine_manage_anubis.settings.default_config_path",
+        "nine_manage_anubis.cli.default_config_path",
+    ):
+        monkeypatch.setattr(target, lambda: config)
+    return config
+
+
+def test_a_malformed_config_file_warns_and_the_run_proceeds(tmp_path, monkeypatch):
+    config = _with_config(monkeypatch, tmp_path, "not valid json {{{")
+    rc, out, err = _run(["status"], runner=_runner())
+    assert rc == 0
+    assert str(config) in err
+    assert "defaults" in err
+    assert "Traceback" not in err
+
+
+def test_config_reports_a_config_file_it_could_not_read(tmp_path, monkeypatch):
+    config = _with_config(monkeypatch, tmp_path, "not valid json {{{")
+    rc, out, err = _run(["config"], runner=_runner())
+    assert rc == 1
+    assert str(config) in out
+    assert "config --init" in out
+
+
+def test_config_init_overwrites_a_config_file_it_could_not_read(tmp_path, monkeypatch):
+    config = _with_config(monkeypatch, tmp_path, "not valid json {{{")
+    rc, out, err = _run(["config", "--init"], runner=_runner())
+    assert rc == 0
+    from nine_manage_anubis.settings import load_settings
+    assert load_settings(config).warning is None
+
+
+def test_a_good_config_file_warns_about_nothing(tmp_path, monkeypatch):
+    _with_config(monkeypatch, tmp_path, json.dumps({"anubis_user": "www-anubis"}))
+    rc, out, err = _run(["status"], runner=_runner())
+    assert rc == 0
+    assert "Ignoring config file" not in err

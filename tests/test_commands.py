@@ -6,7 +6,7 @@ import pytest
 
 from conftest import hostile
 from shellparse import argv, script_argv
-from nine_manage_anubis.runner import CommandTimeout, FakeRunner
+from nine_manage_anubis.runner import CommandFailed, CommandTimeout, FakeRunner
 from nine_manage_anubis.validate import ValidationError
 from nine_manage_anubis.commands import (
     _http_probe,
@@ -18,7 +18,9 @@ from nine_manage_anubis.commands import (
     cmd_restart,
     cmd_status,
     cmd_selftest,
+    ANUBIS_VERSION,
     DEFAULT_ANUBIS_USER,
+    PROBE_FAILED,
     PROBE_TIMEOUT,
 )
 
@@ -32,6 +34,13 @@ VHOSTS_WITH_PROXY = """[
 ]"""
 
 VHOSTS_EMPTY = "[]"
+
+# Two instances on two webroots — for the rolling restart, which must stop at
+# the first unhealthy one rather than carry on to the next.
+VHOSTS_TWO_INSTANCES = """[
+  {"domain": "test.example.ch", "user": "www-anubis", "webroot": "/home/www-anubis/test.example.ch", "template": "proxy_letsencrypt_https_redirect", "template_variables": {"PROXYPORT": "7010"}, "aliases": [], "jobs": []},
+  {"domain": "second.example.ch", "user": "www-anubis", "webroot": "/home/www-anubis/second.example.ch", "template": "proxy_letsencrypt_https_redirect", "template_variables": {"PROXYPORT": "7012"}, "aliases": [], "jobs": []}
+]"""
 
 USERS_JSON = """[{"name": "www-data"}, {"name": "www-anubis"}]"""
 
@@ -831,3 +840,218 @@ def test_a_rolling_restart_stops_when_a_health_probe_times_out(command):
     assert not result.success
     assert "timed out" in " ".join(result.warnings)
     assert "test.example.ch" in result.error
+
+
+# --- One place declares a default ---------------------------------------------
+
+
+def test_command_defaults_are_the_settings_defaults():
+    """A library caller and a CLI caller must mean the same thing by "default"."""
+    from nine_manage_anubis.settings import Settings
+
+    assert DEFAULT_ANUBIS_USER == Settings.anubis_user
+    assert ANUBIS_VERSION == Settings.anubis_version
+
+
+# --- A probe that answered, and what its answer meant -------------------------
+#
+# The status code is a number, so it is compared as one. Classifying it by its
+# first character made 301 and 500 depend on the shape of the string curl
+# printed rather than on the code it stands for.
+
+
+@pytest.mark.parametrize("command", [cmd_restart, cmd_upgrade])
+@pytest.mark.parametrize("code", ["200", "204", "301", "302", "399"])
+def test_a_rolling_restart_accepts_a_2xx_or_3xx(command, code):
+    r = _base_runner(**{"curl -s -o /dev/null -w '%{http_code}'": code})
+    result = command(runner=r)
+    assert result.success, result.error
+    assert f"HTTP {code}" in " ".join(result.steps)
+
+
+@pytest.mark.parametrize("command", [cmd_restart, cmd_upgrade])
+@pytest.mark.parametrize("code", ["000", "400", "404", "500", "502"])
+def test_a_rolling_restart_stops_on_anything_else(command, code):
+    r = _base_runner(**{"curl -s -o /dev/null -w '%{http_code}'": code})
+    result = command(runner=r)
+    assert not result.success
+    assert "test.example.ch" in result.error
+
+
+@pytest.mark.parametrize("command", [cmd_restart, cmd_upgrade])
+@pytest.mark.parametrize("code,reads_as", [
+    ("500", "HTTP 500"),
+    ("301", "HTTP 301"),
+    ("000", "no response"),
+])
+def test_a_rolling_restart_says_what_the_probe_answered(command, code, reads_as):
+    """000 is curl saying it never got a response, not an HTTP 000."""
+    r = _base_runner(**{"curl -s -o /dev/null -w '%{http_code}'": code})
+    result = command(runner=r)
+    reported = " ".join(result.steps + result.warnings + [result.error or ""])
+    assert reads_as in reported
+
+
+@pytest.mark.parametrize("command", [cmd_restart, cmd_upgrade])
+def test_a_rolling_restart_stops_on_an_answer_that_is_not_a_status_code(command):
+    r = _base_runner(**{"curl -s -o /dev/null -w '%{http_code}'": ""})
+    result = command(runner=r)
+    assert not result.success
+    assert "test.example.ch" in result.error
+
+
+# --- A probe that could not be made -------------------------------------------
+#
+# Connection refused, DNS failure, curl missing: the runner raises, and the
+# rolling restart used to catch it and write "HTTP probe skipped" into the
+# steps — a green light on the way to restarting the next instance.
+
+
+class _ProbeFails(FakeRunner):
+    """Every command answers as usual except the health probe, which fails."""
+
+    def __call__(self, cmd, **kwargs):
+        if cmd.startswith("curl -s -o /dev/null"):
+            raise CommandFailed("curl", 7, "Failed to connect to localhost port 7010")
+        return super().__call__(cmd, **kwargs)
+
+
+def _refusing_runner() -> _ProbeFails:
+    return _ProbeFails(_base_runner().responses)
+
+
+@pytest.mark.parametrize("command", [cmd_restart, cmd_upgrade])
+def test_a_rolling_restart_stops_when_the_probe_could_not_be_made(command):
+    r = _refusing_runner()
+    result = command(runner=r)
+    assert not result.success
+    assert "test.example.ch" in result.error
+    assert "skipped" not in " ".join(result.steps).lower()
+    assert any("curl" in w for w in result.warnings)
+
+
+@pytest.mark.parametrize("command", [cmd_restart, cmd_upgrade])
+def test_a_rolling_restart_that_stops_does_not_restart_the_next_instance(command):
+    """The point of a rolling restart: a broken instance is the last one."""
+    r = _ProbeFails(_base_runner(**{
+        "sudo nine-manage-vhosts virtual-host list --json": VHOSTS_TWO_INSTANCES,
+        "ss -tlnp": "",
+        _SU + "ls ~/.config/anubis/*.env 2>/dev/null": (
+            "/home/www-anubis/.config/anubis/test.example.ch.env\n"
+            "/home/www-anubis/.config/anubis/second.example.ch.env\n"
+        ),
+        _SU + "cat -- /home/www-anubis/.config/anubis/second.example.ch.env":
+            "BIND=:7012\nMETRICS_BIND=:7013\n",
+    }).responses)
+    result = command(runner=r)
+    assert not result.success
+    restarts = [c for c in r.calls if "restart anubis@" in c]
+    assert len(restarts) == 1, restarts
+
+
+def test_selftest_reports_a_probe_that_could_not_be_made():
+    result = cmd_selftest(runner=_refusing_runner())
+    assert not result.success
+    assert any("curl" in w for w in result.warnings)
+
+
+def test_status_reports_a_probe_that_could_not_be_made():
+    _, health_map = cmd_status(health=True, runner=_refusing_runner())
+    assert health_map is not None
+    assert health_map["test.example.ch"] != "HTTP 200"
+
+
+def test_status_reports_a_probe_that_never_connected_as_no_response():
+    """curl prints 000 when it got no response at all — not an HTTP 000."""
+    r = _base_runner(**{"curl -s -o /dev/null -w '%{http_code}'": "000"})
+    _, health_map = cmd_status(health=True, runner=r)
+    assert health_map is not None
+    assert health_map["test.example.ch"] == "no response"
+
+
+# --- A vhost record missing a field we need -----------------------------------
+#
+# webroot, user and template are read off the vhost list and built into
+# commands. A vhost type we have not seen, or a change to the JSON upstream,
+# used to surface as a bare KeyError halfway through a batch.
+
+VHOST_WITHOUT = {
+    "webroot": """[
+  {"domain": "example.com", "user": "www-example", "template": "default_letsencrypt_https", "template_variables": {}, "aliases": [], "jobs": []}
+]""",
+    "user": """[
+  {"domain": "example.com", "webroot": "/home/www-example/example.com", "template": "default_letsencrypt_https", "template_variables": {}, "aliases": [], "jobs": []}
+]""",
+    "template": """[
+  {"domain": "example.com", "user": "www-example", "webroot": "/home/www-example/example.com", "template_variables": {}, "aliases": [], "jobs": []}
+]""",
+}
+
+
+@pytest.mark.parametrize("missing", ["webroot", "user", "template"])
+def test_enable_names_the_vhost_and_the_field_it_is_missing(missing):
+    r = _base_runner(**{
+        "sudo nine-manage-vhosts virtual-host list --json": VHOST_WITHOUT[missing],
+    })
+    result = cmd_enable("example.com", runner=r)
+    assert not result.success
+    assert "example.com" in result.error
+    assert missing in result.error
+    assert not any("virtual-host update" in c for c in r.calls)
+
+
+DISABLE_VHOST_WITHOUT = {
+    "webroot": """[
+  {"domain": "example.com", "user": "www-example", "template": "proxy_letsencrypt_https_redirect", "template_variables": {"PROXYPORT": "7010"}, "aliases": [], "jobs": []}
+]""",
+    "user": """[
+  {"domain": "example.com", "webroot": "/home/www-example/example.com", "template": "proxy_letsencrypt_https_redirect", "template_variables": {"PROXYPORT": "7010"}, "aliases": [], "jobs": []}
+]""",
+    "template": """[
+  {"domain": "example.com", "user": "www-example", "webroot": "/home/www-example/example.com", "template_variables": {"PROXYPORT": "7010"}, "aliases": [], "jobs": []}
+]""",
+}
+
+
+@pytest.mark.parametrize("missing", ["webroot", "user", "template"])
+def test_disable_names_the_vhost_and_the_field_it_is_missing(missing):
+    r = _base_runner(**{
+        "sudo nine-manage-vhosts virtual-host list --json":
+            DISABLE_VHOST_WITHOUT[missing],
+    })
+    result = cmd_disable("example.com", runner=r)
+    assert not result.success
+    assert "example.com" in result.error
+    assert missing in result.error
+
+
+@pytest.mark.parametrize("missing", ["webroot", "user", "template"])
+def test_a_dry_run_reports_the_missing_field_too(missing):
+    """Dry run is where an operator checks a batch before running it."""
+    r = _base_runner(**{
+        "sudo nine-manage-vhosts virtual-host list --json": VHOST_WITHOUT[missing],
+    })
+    result = cmd_enable("example.com", runner=r, dry_run=True)
+    assert not result.success
+    assert missing in result.error
+
+
+def test_disable_says_not_behind_anubis_before_it_says_anything_else():
+    """The template is what an operator asked about; a missing webroot only
+    matters once there is an instance to tear down."""
+    r = _base_runner(**{
+        "sudo nine-manage-vhosts virtual-host list --json": VHOST_WITHOUT["webroot"],
+    })
+    result = cmd_disable("example.com", runner=r)
+    assert not result.success
+    assert "not behind Anubis" in result.error
+
+
+def test_one_wording_for_a_probe_that_could_not_be_made():
+    """A rolling restart and `status` must not name the same thing differently."""
+    result = cmd_restart(runner=_refusing_runner())
+    _, health_map = cmd_status(health=True, runner=_refusing_runner())
+    assert health_map is not None
+    assert PROBE_FAILED in result.error
+    assert PROBE_FAILED in " ".join(result.warnings)
+    assert PROBE_FAILED in health_map["test.example.ch"]

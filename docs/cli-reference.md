@@ -116,7 +116,8 @@ The Anubis user is the user that runs the binary and owns `~/.config/anubis/` �
 
 Location: `~/.config/nine-manage-anubis/config.json`
 
-All fields are optional. Missing fields use hardcoded defaults. CLI flags override config file values.
+All fields are optional. A missing field — or one set to `null` — uses the
+default. CLI flags override config file values.
 
 ```json
 {
@@ -184,7 +185,22 @@ A well-formed value that simply isn't Anubis's is skipped rather than fatal: a
 vhost or env file on a port outside 7010–7999, a `/home/*` directory whose name
 can't be a system user, a `.anubis-bak.*` file this tool didn't write.
 
-If the config file itself is rejected, `config` still runs — it prints the
+A config file that cannot be **read or parsed** — malformed JSON, wrong
+permissions — is not fatal: the run continues on defaults. It does not
+continue quietly, though, because an operator who wrote that file believes
+their `anubis_user` or `policy_file` is in effect:
+
+```sh
+$ nine-manage-anubis status
+Warning: Ignoring config file /home/you/.config/nine-manage-anubis/config.json:
+Expecting value: line 1 column 1 (char 0). Continuing with defaults.
+```
+
+A file that *does* parse and supplies a **malformed value** is rejected
+instead, and the run stops — that value was going to be spliced into a `sudo`
+command, so swapping it for a default would hide the tampering.
+
+If the config file itself is rejected or ignored, `config` still runs — it prints the
 rejection and the repair command — so a bad file can't lock you out of the
 tool that fixes it:
 
@@ -508,7 +524,20 @@ After each restart, the CLI:
 
 If the service is not active or the HTTP probe fails, the upgrade stops immediately. Instances already restarted are on the new binary; unrestarted ones are still on the old binary (the old binary is gone from disk, but the running process keeps it in memory).
 
-If `curl` itself fails (e.g., curl not installed), the health check falls back to "service is active" and reports "`Health check: active (service, HTTP probe skipped)`".
+Every way of *not knowing* an instance is healthy stops the roll, because a
+rolling restart that shrugs at an unanswered probe carries the fault to the
+next instance:
+
+| What happened | How it reads |
+|---------------|--------------|
+| 2xx or 3xx | `Health check: active (HTTP 200)` — the roll continues |
+| 4xx or 5xx | `Health check failed for <domain> (HTTP 502)` |
+| `curl` printed `000` — no response at all | `Health check failed for <domain> (no response)` |
+| `curl` failed (not installed, connection refused, DNS failure) | `Health check failed for <domain> (probe failed)` |
+| `curl` printed something that is not a number | `Health check failed for <domain> (unreadable answer '<raw>')` |
+| The probe never answered within 10s | `Health check failed for <domain> (probe timed out)` |
+
+The status code is compared as a number, so `301` passes and `500` does not.
 
 #### Examples
 
@@ -529,7 +558,11 @@ nine-manage-anubis --dry-run upgrade
 #### Errors
 
 - `Health check failed for <domain> (service not active)` — the service didn't come back up after restart. Remaining instances are not restarted.
-- `Health check failed for <domain> (HTTP <code>)` — the service is active but the HTTP probe returned an unexpected status code.
+- `Health check failed for <domain> (HTTP <code>)` — the service is active but the HTTP probe returned a 4xx or 5xx.
+- `Health check failed for <domain> (no response)` — the service is active but `curl` got no response at all.
+- `Health check failed for <domain> (probe failed)` — the probe could not be made: no `curl`, connection refused, DNS failure.
+- `Health check failed for <domain> (unreadable answer '<raw>')` — `curl` printed something that is not a status code.
+- `Health check failed for <domain> (probe timed out)` — the probe was accepted and never answered.
 - `Could not determine latest Anubis version from: <raw>` — the GitHub API query failed (network issue, rate limit).
 
 ---
@@ -584,7 +617,11 @@ nine-manage-anubis --dry-run restart
 #### Errors
 
 - `Health check failed for <domain> (service not active)` — the service didn't come back up after restart.
-- `Health check failed for <domain> (HTTP <code>)` — the service is active but the HTTP probe returned an unexpected status code.
+- `Health check failed for <domain> (HTTP <code>)` — the service is active but the HTTP probe returned a 4xx or 5xx.
+- `Health check failed for <domain> (no response)` — the service is active but `curl` got no response at all.
+- `Health check failed for <domain> (probe failed)` — the probe could not be made: no `curl`, connection refused, DNS failure.
+- `Health check failed for <domain> (unreadable answer '<raw>')` — `curl` printed something that is not a status code.
+- `Health check failed for <domain> (probe timed out)` — the probe was accepted and never answered.
 
 ---
 
@@ -618,7 +655,7 @@ The table output has these columns:
 | `STATE` | systemd service state: `active`, `inactive`, `failed`, `not-found` |
 | `VERSION` | The Anubis binary version string |
 | `VHOSTS` | All domains proxying to this instance's port (comma-separated) |
-| `HEALTH` | (only with `--health`) HTTP status code from the health probe, or `inactive` |
+| `HEALTH` | (only with `--health`) `HTTP <code>` from the probe; `no response` when curl got none, `timed out after 10s` when it never answered, `probe failed (exit <n>)` when it could not be made, `inactive` when the service is not running |
 
 Example output:
 

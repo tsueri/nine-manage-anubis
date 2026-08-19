@@ -32,7 +32,13 @@ from .commands import (
 from .output import format_status, format_steps, format_dry_run
 from .vhosts import webserver_reload
 from .ports import _parse_vhosts_json
-from .settings import Settings, load_settings, default_config_path, default_config_content
+from .settings import (
+    LoadedSettings,
+    Settings,
+    load_settings,
+    default_config_path,
+    default_config_content,
+)
 from .validate import (
     ValidationError,
     validate_domain,
@@ -189,13 +195,19 @@ def main(argv: Sequence[str] | None = None, runner=None) -> int:
 
 
 def _dispatch(argv: Sequence[str] | None = None, runner=None) -> int:
-    settings, settings_error = _load_settings_or_defaults()
+    loaded, settings_error = _load_settings_or_defaults()
+    settings = loaded.settings
     parser = build_parser(settings)
     args = parser.parse_args(argv)
     if settings_error is not None and args.command != "config":
         # `config` is how you diagnose and repair the file, so it stays
         # reachable. Everything else would build commands from it.
         raise settings_error
+    if loaded.warning is not None and args.command != "config":
+        # The run proceeds on defaults — but not without saying that the
+        # anubis_user or policy_file in the file is not the one in effect.
+        # `config` prints it in full below instead.
+        print(f"Warning: {loaded.warning}", file=sys.stderr)
     _validate_args(args)
     if runner is None:
         runner = SubprocessRunner()
@@ -319,38 +331,39 @@ def _dispatch(argv: Sequence[str] | None = None, runner=None) -> int:
         _print_result(result, dry_run, as_json, title="Self-test:")
 
     elif args.command == "config":
-        return _cmd_config(settings, args, settings_error)
+        return _cmd_config(loaded, args, settings_error)
 
     return 0
 
 
-def _load_settings_or_defaults() -> tuple[Settings, ValidationError | None]:
+def _load_settings_or_defaults() -> tuple[LoadedSettings, ValidationError | None]:
     """Load settings, deferring a rejection so `config` can still report it."""
     try:
         return load_settings(), None
     except ValidationError as e:
-        return Settings(), e
+        return LoadedSettings(Settings()), e
 
 
 def _cmd_config(
-    settings: Settings,
+    loaded: LoadedSettings,
     args: argparse.Namespace,
     settings_error: ValidationError | None = None,
 ) -> int:
+    settings = loaded.settings
     path = default_config_path()
     if args.init:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(default_config_content(settings.anubis_user))
         print(f"Created config file: {path}")
         return 0
+    # A file that could not be read and a file whose values were rejected
+    # differ in what the rest of the run does about them — the first proceeds
+    # on defaults, the second stops — but `config` has the same thing to say
+    # about both: the settings printed below are not the ones in that file.
+    if loaded.warning is not None:
+        return _report_unusable_config(path, "ignored", loaded.warning)
     if settings_error is not None:
-        print(f"Config file: {path} (rejected)")
-        print()
-        print(f"  {settings_error}")
-        print()
-        print("Fix the file by hand, or overwrite it with:")
-        print("  nine-manage-anubis config --init")
-        return 1
+        return _report_unusable_config(path, "rejected", str(settings_error))
     exists = "exists" if path.exists() else "does not exist"
     print(f"Config file: {path} ({exists})")
     print()
@@ -359,6 +372,17 @@ def _cmd_config(
     pf = settings.policy_file or "(not set — instances use embedded default policy)"
     print(f"  policy_file:    {pf}")
     return 0
+
+
+def _report_unusable_config(path, verdict: str, problem: str) -> int:
+    """Print what is wrong with the config file and how to repair it."""
+    print(f"Config file: {path} ({verdict})")
+    print()
+    print(f"  {problem}")
+    print()
+    print("Fix the file by hand, or overwrite it with:")
+    print("  nine-manage-anubis config --init")
+    return 1
 
 
 def _print_result(result, dry_run: bool, as_json: bool, title: str = ""):

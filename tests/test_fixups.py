@@ -4,14 +4,18 @@ Run with: python3 -m pytest tests/test_fixups.py -v
 Or:       python3 tests/test_fixups.py
 """
 
+import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
 import pytest
 
+from nine_manage_anubis import fixups
 from nine_manage_anubis.fileops import LocalFileOps
 from nine_manage_anubis.validate import ValidationError
 from nine_manage_anubis.fixups import (
+    SafetyCheckFailed,
     UserIniState,
     HtaccessState,
     SHIM_PHP,
@@ -378,3 +382,63 @@ def test_restore_finds_a_backup_we_did_create(tmp_path):
     ops = LocalFileOps()
     bak = ops.backup(str(target))
     assert ops.glob_backups(str(target)) == [bak]
+
+
+# --- The safety check that must not be optimised away -------------------------
+#
+# Both fixups are no-ops for a vhost that is not behind Anubis only because
+# each is guarded by X-Forwarded-Host. A drifted template silently drops that
+# guard and breaks every sibling vhost sharing the webroot — so the check runs
+# before anything is written, and it has to run in every interpreter this tool
+# is started with, `python -O` included.
+
+
+def test_drifted_shim_is_refused(tmp_path, monkeypatch):
+    monkeypatch.setattr(fixups, "SHIM_PHP", "<?php\n$_SERVER['HTTP_HOST'] = 'x';\n")
+    with pytest.raises(SafetyCheckFailed) as exc:
+        plan(_webroot(tmp_path), _ops())
+    assert "anubis-origin-shim.php" in str(exc.value)
+
+
+def test_drifted_htaccess_block_is_refused(tmp_path, monkeypatch):
+    monkeypatch.setattr(fixups, "HTACCESS_BLOCK", "# nothing conditional here\n")
+    with pytest.raises(SafetyCheckFailed) as exc:
+        plan(_webroot(tmp_path), _ops())
+    assert ".htaccess" in str(exc.value)
+
+
+def test_apply_writes_nothing_when_a_template_drifted(tmp_path, monkeypatch):
+    w = _webroot(tmp_path)
+    monkeypatch.setattr(fixups, "SHIM_PHP", "<?php\n// guard gone\n")
+    with pytest.raises(SafetyCheckFailed):
+        apply(w, _ops(), dry_run=False)
+    assert list(Path(w).iterdir()) == []
+
+
+_UNDER_O = """
+import sys
+sys.path.insert(0, {src!r})
+if __debug__:
+    raise SystemExit("not running under -O")
+from nine_manage_anubis import fixups
+fixups.{template} = "drifted, guard gone"
+try:
+    fixups._verify_safety()
+except fixups.SafetyCheckFailed:
+    print("raised")
+else:
+    print("SILENTLY PASSED")
+"""
+
+
+@pytest.mark.parametrize("template", ["SHIM_PHP", "HTACCESS_BLOCK"])
+def test_safety_check_still_raises_under_python_O(template):
+    """`python -O` strips `assert`, so the check cannot be written with one."""
+    src = str(Path(__file__).parent.parent / "src")
+    proc = subprocess.run(
+        [sys.executable, "-O", "-c", _UNDER_O.format(src=src, template=template)],
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == "raised"

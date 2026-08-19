@@ -14,6 +14,7 @@ from nine_manage_anubis.validate import (
     PORT_RANGE_END,
     PORT_RANGE_START,
     ValidationError,
+    required_vhost_field,
     validate_domain,
     validate_path,
     validate_port,
@@ -357,3 +358,40 @@ def test_user_length_limit_comes_from_the_documented_constant():
 def test_domain_length_limit_comes_from_the_documented_constant():
     with pytest.raises(ValidationError):
         validate_domain("a" * (MAX_DOMAIN_LENGTH + 1))
+
+
+# --- A field the vhost list did not report ------------------------------------
+#
+# A webroot, a user or a template is read straight off the JSON and used to
+# build a command. Indexing the dict for it turns an unexpected shape — or an
+# upstream change — into a bare KeyError, which tells an operator nothing.
+
+
+def test_required_field_returns_the_value():
+    record = {"domain": "example.com", "webroot": "/home/www-example/example.com"}
+    assert required_vhost_field(record, "webroot") == "/home/www-example/example.com"
+
+
+@pytest.mark.parametrize("record", [
+    {"domain": "example.com"},
+    {"domain": "example.com", "webroot": None},
+])
+def test_missing_required_field_names_the_vhost_and_the_field(record):
+    with pytest.raises(ValidationError) as exc:
+        required_vhost_field(record, "webroot")
+    assert "example.com" in str(exc.value)
+    assert "webroot" in str(exc.value)
+
+
+def test_missing_required_field_on_a_nameless_record_still_reports():
+    with pytest.raises(ValidationError) as exc:
+        required_vhost_field({}, "template")
+    assert "template" in str(exc.value)
+
+
+def test_a_required_field_of_the_wrong_type_is_rejected():
+    """An upstream shape change is a message, not a command built round a dict."""
+    with pytest.raises(ValidationError) as exc:
+        required_vhost_field({"domain": "example.com", "webroot": {"path": "/x"}}, "webroot")
+    assert "example.com" in str(exc.value)
+    assert "webroot" in str(exc.value)
