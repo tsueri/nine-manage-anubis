@@ -15,9 +15,19 @@ from dataclasses import dataclass, field
 
 from .runner import Runner, SubprocessRunner
 from .nine_su import nine_su, nine_su_systemd
+from .validate import (
+    MAX_TCP_PORT,
+    MIN_TCP_PORT,
+    PORT_RANGE_END,
+    PORT_RANGE_START,
+    ValidationError,
+    validate_domain,
+    validate_path,
+    validate_port,
+    validate_system_user,
+    validate_vhost_record,
+)
 
-PORT_RANGE_START = 7010
-PORT_RANGE_END = 7999
 PAIR_STRIDE = 2
 
 
@@ -51,8 +61,17 @@ class PortAllocation:
 
 
 def _parse_vhosts_json(runner: Runner) -> list[dict]:
+    """Read the vhost list, validating every field we later interpolate."""
     raw = runner("sudo nine-manage-vhosts virtual-host list --json")
-    return json.loads(raw)
+    vhosts = json.loads(raw)
+    if not isinstance(vhosts, list):
+        raise ValidationError(
+            f"Invalid vhost list from nine-manage-vhosts: expected a JSON "
+            f"array, got {type(vhosts).__name__}."
+        )
+    for vh in vhosts:
+        validate_vhost_record(vh)
+    return vhosts
 
 
 def _is_anubis_proxy(vhost: dict) -> bool:
@@ -72,6 +91,7 @@ def _get_proxy_port(vhost: dict) -> int | None:
 def find_instance_for_webroot(
     webroot: str, runner: Runner = SubprocessRunner()
 ) -> int | None:
+    validate_path(webroot, field="webroot")
     vhosts = _parse_vhosts_json(runner)
     for vh in vhosts:
         if vh.get("webroot") == webroot and _is_anubis_proxy(vh):
@@ -91,6 +111,7 @@ def find_vhosts_for_port(port: int, runner: Runner = SubprocessRunner()) -> list
 
 
 def get_vhost(domain: str, runner: Runner = SubprocessRunner()) -> dict | None:
+    validate_domain(domain)
     vhosts = _parse_vhosts_json(runner)
     for vh in vhosts:
         if vh["domain"] == domain:
@@ -136,6 +157,15 @@ def _find_anubis_users(runner: Runner) -> list[str]:
     for line in output.strip().splitlines():
         path = line.strip().rstrip("/")
         user = path.rsplit("/", 1)[-1]
+        # /home holds whatever the operator put there, so a name that isn't a
+        # valid system user is just not a user — skip it rather than abort the
+        # scan. Skipping is safe: it can't hide an Anubis instance, because an
+        # instance lives in a real user's home. It also keeps the name out of
+        # the command below, which is the point.
+        try:
+            validate_system_user(user, field="home directory user")
+        except ValidationError:
+            continue
         check = runner(f"test -d /home/{user}/.config/anubis && echo yes || echo no")
         if check.strip() == "yes":
             users.append(user)
@@ -156,16 +186,29 @@ def get_claimed_ports(runner: Runner = SubprocessRunner()) -> dict[int, tuple[st
             env_path = env_path.strip()
             if not env_path:
                 continue
+            # The instance domain is the env file's stem, and it becomes the
+            # systemd instance name — validate it before it reaches a command.
+            domain = env_path.rsplit("/", 1)[-1]
+            if domain.endswith(".env"):
+                domain = domain[: -len(".env")]
+            validate_domain(domain, field="instance domain from env file")
+            validate_path(env_path, field="env file path")
             content = nine_su(user, f"cat '{env_path}'", runner)
             env = _parse_env_file(content)
             bind = env.get("BIND", "")
             port_match = re.match(r":(\d+)", bind)
             if port_match:
-                port = int(port_match.group(1))
-                domain = env_path.rsplit("/", 1)[-1].rsplit(".", 1)[0]
-                if domain.endswith(".env"):
-                    domain = env_path.rsplit("/", 1)[-1][:-4]
-                claimed[port] = (user, domain)
+                # A non-numeric or absurd BIND is corruption and is fatal, but
+                # a valid port outside our range just isn't ours to claim —
+                # skip it the same way discover_instances() filters vhosts.
+                port = validate_port(
+                    port_match.group(1),
+                    field="BIND port in env file",
+                    minimum=MIN_TCP_PORT,
+                    maximum=MAX_TCP_PORT,
+                )
+                if PORT_RANGE_START <= port <= PORT_RANGE_END:
+                    claimed[port] = (user, domain)
     return claimed
 
 
@@ -258,6 +301,7 @@ def find_port_for_domain(
     domain: str, runner: Runner = SubprocessRunner()
 ) -> int | None:
     """Find the port allocated for a domain from its env file."""
+    validate_domain(domain)
     claimed = get_claimed_ports(runner)
     for port, (user, dom) in claimed.items():
         if dom == domain:
@@ -276,6 +320,9 @@ def find_prepared_port_for_webroot(
     Reuse that port instead of allocating a new one (which would
     become an orphan once the cutover detects the webroot match).
     """
+    validate_path(webroot, field="webroot")
+    if exclude_domain is not None:
+        validate_domain(exclude_domain)
     vhosts = _parse_vhosts_json(runner)
     domains_with_webroot = {
         vh["domain"] for vh in vhosts

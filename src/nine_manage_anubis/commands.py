@@ -57,10 +57,39 @@ from .systemd import (
 )
 from .fixups import apply as apply_fixups, restore as restore_fixups
 from .fileops import RemoteFileOps
+from .validate import (
+    validate_domain,
+    validate_path,
+    validate_system_user,
+    validate_version,
+)
 
 
 DEFAULT_ANUBIS_USER = "www-anubis"
 ANUBIS_VERSION = "1.27.0"
+
+
+def _validate_inputs(
+    anubis_user: str | None = None,
+    policy_file: str | None = None,
+    domain: str | None = None,
+    version: str | None = None,
+) -> None:
+    """Whitelist every caller-supplied value before any command is built.
+
+    Called first thing in each public command entry point so the library is
+    safe when driven directly, not just through the CLI. Raises
+    ValidationError; no sudo command has been constructed at that point.
+    Arguments a given command doesn't take are simply left out.
+    """
+    if anubis_user is not None:
+        validate_system_user(anubis_user, field="Anubis user")
+    if policy_file is not None:
+        validate_path(policy_file, field="policy_file")
+    if domain is not None:
+        validate_domain(domain)
+    if version is not None:
+        validate_version(version)
 
 
 @dataclass
@@ -85,6 +114,8 @@ def cmd_install(
     policy_file: str | None = None,
     init_policy: bool = False,
 ) -> CommandResult:
+    _validate_inputs(anubis_user, policy_file=policy_file, version=version)
+
     result = CommandResult()
 
     if not dry_run:
@@ -133,6 +164,8 @@ def cmd_uninstall(
     runner: Runner = SubprocessRunner(),
     dry_run: bool = False,
 ) -> CommandResult:
+    _validate_inputs(anubis_user)
+
     result = CommandResult()
 
     instances = discover_instances(runner=runner)
@@ -192,6 +225,8 @@ def cmd_enable(
     policy_file: str | None = None,
     no_notify: bool = False,
 ) -> CommandResult:
+    _validate_inputs(anubis_user, policy_file=policy_file, domain=domain)
+
     result = CommandResult()
 
     vh = get_vhost(domain, runner=runner)
@@ -328,6 +363,8 @@ def cmd_disable(
     anubis_user: str = DEFAULT_ANUBIS_USER,
     no_notify: bool = False,
 ) -> CommandResult:
+    _validate_inputs(anubis_user, domain=domain)
+
     result = CommandResult()
 
     vh = get_vhost(domain, runner=runner)
@@ -401,6 +438,8 @@ def cmd_upgrade(
     no_rolling: bool = False,
     anubis_user: str = DEFAULT_ANUBIS_USER,
 ) -> CommandResult:
+    _validate_inputs(anubis_user, version=version)
+
     result = CommandResult()
 
     target_version = version or get_latest_version(runner=runner)
@@ -470,6 +509,8 @@ def cmd_status(
     runner: Runner = SubprocessRunner(),
     health: bool = False,
 ) -> tuple[list[AnubisInstance], dict[str, str] | None]:
+    _validate_inputs(domain=domain)
+
     instances = discover_instances(runner=runner)
 
     if domain:
@@ -511,6 +552,8 @@ def cmd_selftest(
     dry_run: bool = False,
     anubis_user: str = DEFAULT_ANUBIS_USER,
 ) -> CommandResult:
+    _validate_inputs(anubis_user)
+
     result = CommandResult()
 
     if dry_run:
@@ -578,6 +621,8 @@ def cmd_restart(
     no_rolling: bool = False,
     anubis_user: str = DEFAULT_ANUBIS_USER,
 ) -> CommandResult:
+    _validate_inputs(anubis_user)
+
     result = CommandResult()
 
     instances = discover_instances(runner=runner)

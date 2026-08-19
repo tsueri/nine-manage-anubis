@@ -5,7 +5,10 @@ are now heredoc-based (sudo nine-su <user> <<'EOF' ... EOF) instead of
 the broken -c pattern.
 """
 
+import pytest
+
 from nine_manage_anubis.runner import FakeRunner
+from nine_manage_anubis.validate import ValidationError
 from nine_manage_anubis.ports import (
     AnubisInstance,
     PortAllocation,
@@ -459,3 +462,189 @@ def test_allocate_for_domain_reuses_prepared_sibling_not_yet_cut_over():
     assert alloc.is_reused
     assert alloc.app_port == 7020
     assert alloc.reused_from == "site-a.ch"
+
+
+# --- Untrusted input from nine-manage-vhosts JSON -----------------------------
+#
+# The JSON comes back from a privileged command, but its contents are
+# operator-supplied strings that get interpolated straight into further
+# sudo commands. Treat them as untrusted.
+
+
+def test_parse_vhosts_json_rejects_injected_domain():
+    hostile = """[
+  {"domain": "evil.com; id", "user": "www-example", "webroot": "/home/www-example/x", "template": "default_letsencrypt_https", "template_variables": {}}
+]"""
+    r = FakeRunner({"sudo nine-manage-vhosts virtual-host list --json": hostile})
+    with pytest.raises(ValidationError) as exc:
+        _parse_vhosts_json(r)
+    assert "evil.com; id" in str(exc.value)
+
+
+def test_parse_vhosts_json_rejects_injected_user():
+    hostile = """[
+  {"domain": "example.com", "user": "www-example`id`", "webroot": "/home/www-example/x", "template": "default_letsencrypt_https", "template_variables": {}}
+]"""
+    r = FakeRunner({"sudo nine-manage-vhosts virtual-host list --json": hostile})
+    with pytest.raises(ValidationError) as exc:
+        _parse_vhosts_json(r)
+    assert "www-example`id`" in str(exc.value)
+
+
+def test_parse_vhosts_json_rejects_injected_proxyport():
+    hostile = """[
+  {"domain": "example.com", "user": "www-example", "webroot": "/home/www-example/x", "template": "proxy_letsencrypt_https_redirect", "template_variables": {"PROXYPORT": "7010; id"}}
+]"""
+    r = FakeRunner({"sudo nine-manage-vhosts virtual-host list --json": hostile})
+    with pytest.raises(ValidationError):
+        _parse_vhosts_json(r)
+
+
+def test_parse_vhosts_json_tolerates_entry_without_user():
+    """Not every vhost record is guaranteed to carry a user field."""
+    sparse = """[
+  {"domain": "example.com", "webroot": "/home/www-example/x", "template": "default_letsencrypt_https", "template_variables": {}}
+]"""
+    r = FakeRunner({"sudo nine-manage-vhosts virtual-host list --json": sparse})
+    assert _parse_vhosts_json(r)[0]["domain"] == "example.com"
+
+
+def test_parse_vhosts_json_rejects_non_list():
+    r = FakeRunner({"sudo nine-manage-vhosts virtual-host list --json": '{"domain": "x"}'})
+    with pytest.raises(ValidationError):
+        _parse_vhosts_json(r)
+
+
+def test_get_vhost_rejects_injected_lookup_domain():
+    r = _runner_with_data()
+    with pytest.raises(ValidationError):
+        get_vhost("example.com; id", r)
+    assert r.calls == []
+
+
+def test_find_instance_for_webroot_rejects_injected_webroot():
+    r = _runner_with_data()
+    with pytest.raises(ValidationError):
+        find_instance_for_webroot("/home/www-example/x; id", r)
+    assert r.calls == []
+
+
+def test_allocate_for_domain_rejects_injected_domain():
+    r = _runner_with_data()
+    with pytest.raises(ValidationError):
+        allocate_for_domain("example.com$(id)", r)
+    assert r.calls == []
+
+
+# --- Untrusted input from env-file scanning -----------------------------------
+
+
+def test_find_anubis_users_skips_directory_names_that_are_not_users():
+    """/home holds whatever the operator put there. A name that can't be a
+    system user is skipped — never interpolated into the probe command, and
+    never fatal, because one odd directory must not take down the whole scan."""
+    r = FakeRunner({
+        "ls -d /home/www-*/ 2>/dev/null": (
+            "/home/www-evil`id`/\n"
+            "/home/www-old.bak/\n"
+            "/home/www-anubis/\n"
+        ),
+        "test -d /home/www-anubis/.config/anubis && echo yes || echo no": "yes",
+    })
+    assert _find_anubis_users(r) == ["www-anubis"]
+    assert not any("www-evil" in c for c in r.calls[1:])
+    assert not any("www-old.bak" in c for c in r.calls[1:])
+
+
+def test_get_claimed_ports_rejects_injected_env_filename():
+    r = FakeRunner({
+        "ls -d /home/www-*/ 2>/dev/null": "/home/www-anubis/\n",
+        "test -d /home/www-anubis/.config/anubis && echo yes || echo no": "yes",
+        _su_key("ls ~/.config/anubis/*.env 2>/dev/null"):
+            "/home/www-anubis/.config/anubis/evil.com; id.env\n",
+    })
+    with pytest.raises(ValidationError) as exc:
+        get_claimed_ports(r)
+    assert "evil.com; id" in str(exc.value)
+
+
+def _env_scan_runner(env_content: str, stem: str = "example.com") -> FakeRunner:
+    return FakeRunner({
+        "ls -d /home/www-*/ 2>/dev/null": "/home/www-anubis/\n",
+        "test -d /home/www-anubis/.config/anubis && echo yes || echo no": "yes",
+        _su_key("ls ~/.config/anubis/*.env 2>/dev/null"):
+            f"/home/www-anubis/.config/anubis/{stem}.env\n",
+        _su_key(f"cat '/home/www-anubis/.config/anubis/{stem}.env'"): env_content,
+    })
+
+
+def test_get_claimed_ports_rejects_absurd_bind_port():
+    """Not a plausible TCP port at all — the env file is corrupt."""
+    with pytest.raises(ValidationError):
+        get_claimed_ports(_env_scan_runner("BIND=:99999\n"))
+
+
+def test_get_claimed_ports_skips_bind_port_outside_the_anubis_range():
+    """A valid port that isn't ours to claim is skipped, not fatal — the same
+    way discover_instances() filters out-of-range vhosts. Aborting here would
+    take down `status` for the whole host over one stray env file."""
+    assert get_claimed_ports(_env_scan_runner("BIND=:3000\n")) == {}
+
+
+def test_get_claimed_ports_claims_bind_port_inside_the_anubis_range():
+    claimed = get_claimed_ports(_env_scan_runner("BIND=:7010\n"))
+    assert claimed == {7010: ("www-anubis", "example.com")}
+
+
+def test_get_claimed_ports_rejects_env_stem_that_is_not_a_domain():
+    """The stem becomes the systemd instance name, so it has to be a domain.
+    Deliberately fatal: a file we don't recognise in our own config directory
+    is either corruption or someone else's doing."""
+    with pytest.raises(ValidationError) as exc:
+        get_claimed_ports(_env_scan_runner("BIND=:7010\n", stem="not_a_domain"))
+    assert "not_a_domain" in str(exc.value)
+
+
+def test_get_claimed_ports_ignores_env_file_without_bind():
+    r = FakeRunner({
+        "ls -d /home/www-*/ 2>/dev/null": "/home/www-anubis/\n",
+        "test -d /home/www-anubis/.config/anubis && echo yes || echo no": "yes",
+        _su_key("ls ~/.config/anubis/*.env 2>/dev/null"):
+            "/home/www-anubis/.config/anubis/example.com.env\n",
+        _su_key("cat '/home/www-anubis/.config/anubis/example.com.env'"):
+            "TARGET_HOST=origin-example.com\n",
+    })
+    assert get_claimed_ports(r) == {}
+
+
+def test_parse_vhosts_json_rejects_injected_webroot():
+    hostile = """[
+  {"domain": "example.com", "user": "www-example", "webroot": "/home/www-example/x; id", "template": "default_letsencrypt_https", "template_variables": {}}
+]"""
+    r = FakeRunner({"sudo nine-manage-vhosts virtual-host list --json": hostile})
+    with pytest.raises(ValidationError) as exc:
+        _parse_vhosts_json(r)
+    assert "/home/www-example/x; id" in str(exc.value)
+
+
+def test_parse_vhosts_json_rejects_injected_php_version():
+    """PHP_VERSION is copied into the origin vhost's --template-variable."""
+    hostile = """[
+  {"domain": "example.com", "user": "www-example", "webroot": "/home/www-example/x", "template": "default_letsencrypt_https", "template_variables": {"PHP_VERSION": "8.2; id"}}
+]"""
+    r = FakeRunner({"sudo nine-manage-vhosts virtual-host list --json": hostile})
+    with pytest.raises(ValidationError) as exc:
+        _parse_vhosts_json(r)
+    assert "8.2; id" in str(exc.value)
+
+
+def test_parse_vhosts_json_keeps_out_of_range_proxyport():
+    """A non-Anubis proxy vhost (e.g. a node app on 3000) is not an error —
+    it is simply filtered out later by the allocation-range check."""
+    other = """[
+  {"domain": "app.example.com", "user": "www-example", "webroot": "/home/www-example/x", "template": "proxy_letsencrypt_https_redirect", "template_variables": {"PROXYPORT": "3000"}}
+]"""
+    r = FakeRunner({"sudo nine-manage-vhosts virtual-host list --json": other})
+    vhosts = _parse_vhosts_json(r)
+    assert _get_proxy_port(vhosts[0]) == 3000
+    assert discover_instances(r) == []

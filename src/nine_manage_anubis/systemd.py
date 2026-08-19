@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from .runner import Runner, SubprocessRunner
 from .nine_su import nine_su, nine_su_systemd
+from .validate import validate_version
 
 
 def daemon_reload(user: str, runner: Runner = SubprocessRunner()) -> str:
@@ -149,11 +150,13 @@ def get_latest_version(runner: Runner = SubprocessRunner()) -> str:
         "curl -sL https://api.github.com/repos/TecharoHQ/anubis/releases/latest "
         "| grep -m1 '\"tag_name\"'"
     )
-    # Parse "tag_name": "v1.27.0" from the grep output
+    # Parse "tag_name": "v1.27.0" from the grep output. The response is
+    # untrusted network data and the version lands in a download URL and a
+    # tar path, so it has to clear the whitelist like any other input.
     import re
     m = re.search(r'"tag_name"\s*:\s*"v?([^"]+)"', raw)
     if m:
-        return m.group(1)
+        return validate_version(m.group(1), field="latest Anubis version")
     raise RuntimeError(f"Could not determine latest Anubis version from: {raw}")
 
 

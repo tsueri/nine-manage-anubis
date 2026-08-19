@@ -1,6 +1,10 @@
 """Tests for commands.py — command implementations."""
 
+import pytest
+
+from conftest import hostile
 from nine_manage_anubis.runner import FakeRunner
+from nine_manage_anubis.validate import ValidationError
 from nine_manage_anubis.commands import (
     cmd_install,
     cmd_uninstall,
@@ -547,3 +551,152 @@ def test_enable_reuse_creates_certificate_if_missing():
     assert any("certificate" in s.lower() and "created" in s.lower() for s in result.steps)
     assert len(cert_commands) == 1
     assert "blog.example.ch" in cert_commands[0]
+
+
+# --- Input validation at the command entry points -----------------------------
+#
+# The library must be safe when driven directly, not just through the CLI.
+# Every command function rejects malformed input before it builds a single
+# sudo command.
+
+HOSTILE_DOMAINS = hostile("example.com")
+HOSTILE_USERS = hostile("www-anubis")
+HOSTILE_VERSIONS = hostile("1.27.0")
+
+
+@pytest.mark.parametrize("domain", HOSTILE_DOMAINS)
+def test_cmd_enable_rejects_malformed_domain(domain):
+    r = _base_runner()
+    with pytest.raises(ValidationError) as exc:
+        cmd_enable(domain, runner=r)
+    assert repr(domain) in str(exc.value)
+    assert r.calls == []
+
+
+@pytest.mark.parametrize("domain", HOSTILE_DOMAINS)
+def test_cmd_disable_rejects_malformed_domain(domain):
+    r = _base_runner()
+    with pytest.raises(ValidationError):
+        cmd_disable(domain, runner=r)
+    assert r.calls == []
+
+
+@pytest.mark.parametrize("user", HOSTILE_USERS)
+def test_cmd_enable_rejects_malformed_anubis_user(user):
+    r = _base_runner()
+    with pytest.raises(ValidationError):
+        cmd_enable("example.com", runner=r, anubis_user=user)
+    assert r.calls == []
+
+
+@pytest.mark.parametrize("user", HOSTILE_USERS)
+def test_cmd_disable_rejects_malformed_anubis_user(user):
+    r = _base_runner()
+    with pytest.raises(ValidationError):
+        cmd_disable("test.example.ch", runner=r, anubis_user=user)
+    assert r.calls == []
+
+
+@pytest.mark.parametrize("user", HOSTILE_USERS)
+def test_cmd_install_rejects_malformed_anubis_user(user):
+    r = _base_runner()
+    with pytest.raises(ValidationError):
+        cmd_install(anubis_user=user, runner=r)
+    assert r.calls == []
+
+
+@pytest.mark.parametrize("version", HOSTILE_VERSIONS)
+def test_cmd_install_rejects_malformed_version(version):
+    r = _base_runner()
+    with pytest.raises(ValidationError):
+        cmd_install(anubis_user="www-anubis", version=version, runner=r)
+    assert r.calls == []
+
+
+@pytest.mark.parametrize("user", HOSTILE_USERS)
+def test_cmd_uninstall_rejects_malformed_anubis_user(user):
+    r = _base_runner()
+    with pytest.raises(ValidationError):
+        cmd_uninstall(anubis_user=user, runner=r)
+    assert r.calls == []
+
+
+@pytest.mark.parametrize("version", HOSTILE_VERSIONS)
+def test_cmd_upgrade_rejects_malformed_version(version):
+    r = _base_runner()
+    with pytest.raises(ValidationError):
+        cmd_upgrade(version=version, runner=r)
+    assert r.calls == []
+
+
+@pytest.mark.parametrize("user", HOSTILE_USERS)
+def test_cmd_upgrade_rejects_malformed_anubis_user(user):
+    r = _base_runner()
+    with pytest.raises(ValidationError):
+        cmd_upgrade(anubis_user=user, runner=r)
+    assert r.calls == []
+
+
+@pytest.mark.parametrize("user", HOSTILE_USERS)
+def test_cmd_restart_rejects_malformed_anubis_user(user):
+    r = _base_runner()
+    with pytest.raises(ValidationError):
+        cmd_restart(anubis_user=user, runner=r)
+    assert r.calls == []
+
+
+@pytest.mark.parametrize("user", HOSTILE_USERS)
+def test_cmd_selftest_rejects_malformed_anubis_user(user):
+    r = _base_runner()
+    with pytest.raises(ValidationError):
+        cmd_selftest(anubis_user=user, runner=r)
+    assert r.calls == []
+
+
+@pytest.mark.parametrize("domain", HOSTILE_DOMAINS)
+def test_cmd_status_rejects_malformed_domain_filter(domain):
+    r = _base_runner()
+    with pytest.raises(ValidationError):
+        cmd_status(domain=domain, runner=r)
+    assert r.calls == []
+
+
+def test_dry_run_also_rejects_malformed_input():
+    """Dry run must not be a way to smuggle a value past validation."""
+    r = _base_runner()
+    with pytest.raises(ValidationError):
+        cmd_enable("example.com; id", runner=r, dry_run=True)
+    assert r.calls == []
+
+
+def test_cmd_install_rejects_malformed_policy_file():
+    r = _base_runner()
+    with pytest.raises(ValidationError):
+        cmd_install(runner=r, policy_file="/tmp/policy.yaml; id", init_policy=True)
+    assert r.calls == []
+
+
+def test_cmd_enable_rejects_malformed_policy_file():
+    r = _base_runner()
+    with pytest.raises(ValidationError):
+        cmd_enable("example.com", runner=r, policy_file="/tmp/p.yaml`id`")
+    assert r.calls == []
+
+
+def test_cmd_upgrade_rejects_malformed_version_from_github():
+    """get_latest_version parses an HTTP response — untrusted."""
+    r = _base_runner(**{
+        "curl -sL https://api.github.com/repos/TecharoHQ/anubis/releases/latest "
+        "| grep -m1 '\"tag_name\"'": '"tag_name": "v1.27.0; id"',
+    })
+    with pytest.raises(ValidationError) as exc:
+        cmd_upgrade(runner=r)
+    assert "1.27.0; id" in str(exc.value)
+    assert not any("curl -sLO" in c for c in r.calls)
+
+
+def test_valid_input_still_works():
+    """The whitelist must not reject the ordinary case."""
+    r = _base_runner()
+    result = cmd_enable("example.com", runner=r, dry_run=True)
+    assert result.success

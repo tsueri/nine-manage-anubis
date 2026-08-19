@@ -33,6 +33,12 @@ from .output import format_status, format_steps, format_dry_run
 from .vhosts import webserver_reload
 from .ports import _parse_vhosts_json
 from .settings import Settings, load_settings, default_config_path, default_config_content
+from .validate import (
+    ValidationError,
+    validate_domain,
+    validate_system_user,
+    validate_version,
+)
 
 
 def build_parser(settings: Settings) -> argparse.ArgumentParser:
@@ -110,6 +116,24 @@ def build_parser(settings: Settings) -> argparse.ArgumentParser:
     return parser
 
 
+def _validate_args(args: argparse.Namespace) -> None:
+    """Whitelist every user-supplied value before anything is executed.
+
+    Runs on the parsed namespace, so a bad value in a batch of twenty domains
+    stops the whole run rather than being discovered halfway through, after
+    the first ten have already been cut over.
+    """
+    validate_system_user(args.anubis_user, field="--anubis-user")
+    if getattr(args, "version", None) is not None:
+        validate_version(args.version, field="--version")
+    if getattr(args, "user", None) is not None:
+        validate_system_user(args.user, field="--user")
+    if getattr(args, "domain", None) is not None:
+        validate_domain(args.domain, field="--domain")
+    for domain in getattr(args, "domains", []):
+        validate_domain(domain)
+
+
 def _resolve_domains(args: argparse.Namespace, runner) -> list[str]:
     """Resolve --all --user into a list of domains."""
     if not getattr(args, "all", False):
@@ -163,9 +187,14 @@ def main(argv: Sequence[str] | None = None, runner=None) -> int:
 
 
 def _dispatch(argv: Sequence[str] | None = None, runner=None) -> int:
-    settings = load_settings()
+    settings, settings_error = _load_settings_or_defaults()
     parser = build_parser(settings)
     args = parser.parse_args(argv)
+    if settings_error is not None and args.command != "config":
+        # `config` is how you diagnose and repair the file, so it stays
+        # reachable. Everything else would build commands from it.
+        raise settings_error
+    _validate_args(args)
     if runner is None:
         runner = SubprocessRunner()
     dry_run = args.dry_run
@@ -288,18 +317,38 @@ def _dispatch(argv: Sequence[str] | None = None, runner=None) -> int:
         _print_result(result, dry_run, as_json, title="Self-test:")
 
     elif args.command == "config":
-        _cmd_config(settings, args)
+        return _cmd_config(settings, args, settings_error)
 
     return 0
 
 
-def _cmd_config(settings: Settings, args: argparse.Namespace) -> None:
+def _load_settings_or_defaults() -> tuple[Settings, ValidationError | None]:
+    """Load settings, deferring a rejection so `config` can still report it."""
+    try:
+        return load_settings(), None
+    except ValidationError as e:
+        return Settings(), e
+
+
+def _cmd_config(
+    settings: Settings,
+    args: argparse.Namespace,
+    settings_error: ValidationError | None = None,
+) -> int:
     path = default_config_path()
     if args.init:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(default_config_content(settings.anubis_user))
         print(f"Created config file: {path}")
-        return
+        return 0
+    if settings_error is not None:
+        print(f"Config file: {path} (rejected)")
+        print()
+        print(f"  {settings_error}")
+        print()
+        print("Fix the file by hand, or overwrite it with:")
+        print("  nine-manage-anubis config --init")
+        return 1
     exists = "exists" if path.exists() else "does not exist"
     print(f"Config file: {path} ({exists})")
     print()
@@ -307,6 +356,7 @@ def _cmd_config(settings: Settings, args: argparse.Namespace) -> None:
     print(f"  anubis_version: {settings.anubis_version}")
     pf = settings.policy_file or "(not set — instances use embedded default policy)"
     print(f"  policy_file:    {pf}")
+    return 0
 
 
 def _print_result(result, dry_run: bool, as_json: bool, title: str = ""):

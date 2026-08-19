@@ -11,6 +11,7 @@ For the manual runbook explaining the architecture and the origin dance, see [ru
 - [Synopsis](#synopsis)
 - [Global flags](#global-flags)
 - [Configuration file](#configuration-file)
+- [Input validation](#input-validation)
 - [Commands](#commands)
   - [install](#install)
   - [uninstall](#uninstall)
@@ -141,6 +142,75 @@ To inspect current settings:
 
 ```sh
 nine-manage-anubis config
+```
+
+---
+
+## Input validation
+
+Every domain, system user, version and path reaches a `sudo` command, so each
+one must first match a whitelist. Anything that doesn't match is rejected with
+a message naming the value and the expected form, and the CLI exits `1`
+**before any command is built**.
+
+| Value | Accepted form | Examples |
+|-------|---------------|----------|
+| Domain | Lowercase letters, digits, dots and hyphens, as dot-separated DNS labels; max 253 chars | `example.com`, `forum.example.ch` |
+| System user | `[a-z_][a-z0-9_-]*`, max 32 chars | `www-anubis`, `www-example` |
+| Anubis version | Three-part version, no leading `v` | `1.27.0` |
+| PHP version | Two-part version | `8.2` |
+| Anubis port | Integer in 7010–7999 | `7014` |
+| Other `PROXYPORT` | Any TCP port 1–65535 — a vhost may proxy to something that isn't Anubis | `3000` |
+| Path (`policy_file`, webroots) | Absolute, letters/digits/`._-/` only, no `..` segment | `/home/www-anubis/policy.yaml` |
+| File name (chained `auto_prepend_file`) | One path component, no separator, no `..` | `wordfence-waf.php` |
+
+```sh
+$ nine-manage-anubis enable 'example.com; id'
+Error: Invalid domain 'example.com; id': expected lowercase letters, digits,
+dots and hyphens, as dot-separated DNS labels (e.g. example.com).
+$ echo $?
+1
+```
+
+The same whitelist is applied to values the CLI *reads back* rather than
+receives — `nine-manage-vhosts` JSON (domains, users, webroots, `PROXYPORT`,
+`PHP_VERSION`), env-file scans (instance domains and `BIND` ports), webroot
+files (the chained `auto_prepend_file` name in `.user.ini` and
+`anubis-prepend-chain.php`), the config file (`anubis_user`, `anubis_version`,
+`policy_file`) and the version parsed out of the GitHub releases API. A
+malformed value from any of those is treated as tampering and aborts the run.
+
+A well-formed value that simply isn't Anubis's is skipped rather than fatal: a
+vhost or env file on a port outside 7010–7999, a `/home/*` directory whose name
+can't be a system user, a `.anubis-bak.*` file this tool didn't write.
+
+If the config file itself is rejected, `config` still runs — it prints the
+rejection and the repair command — so a bad file can't lock you out of the
+tool that fixes it:
+
+```sh
+$ nine-manage-anubis config
+Config file: /home/you/.config/nine-manage-anubis/config.json (rejected)
+
+  Invalid anubis_user in config file 'www-anubis; id': expected a system user
+  name: lowercase letters, digits, underscores and hyphens, starting with a
+  letter or underscore (e.g. www-anubis).
+
+Fix the file by hand, or overwrite it with:
+  nine-manage-anubis config --init
+```
+
+Validation also runs inside the command functions themselves, so the package
+is safe when driven as a library rather than through the CLI:
+
+```python
+from nine_manage_anubis.commands import cmd_enable
+from nine_manage_anubis.validate import ValidationError
+
+try:
+    cmd_enable("example.com; id")
+except ValidationError as e:
+    ...  # nothing was executed
 ```
 
 ---
@@ -775,9 +845,11 @@ Steps are prefixed with `[DRY RUN]` and the title:
 | Code | Meaning |
 |------|---------|
 | 0 | Success, or self-test completed (even with warnings) |
-| 1 | `enable` or `disable` found no domains to process, or at least one domain in a batch failed |
+| 1 | Input rejected by [validation](#input-validation), a command failed, `enable`/`disable` found no domains to process, or at least one domain in a batch failed |
+| 2 | Argument parsing failed (argparse) |
+| 130 | Interrupted (Ctrl-C) |
 
-Most commands return 0 even on error — the error is reported in stderr and the JSON `error` field. The exception is `enable` and `disable` in batch mode: if any domain fails, the exit code is 1.
+Most commands return 0 even on a reported error — the error is in stderr and the JSON `error` field. The exceptions: `enable` and `disable` in batch mode return 1 if any domain fails, and any rejected input or unhandled command failure returns 1.
 
 ---
 

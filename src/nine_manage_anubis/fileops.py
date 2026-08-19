@@ -8,12 +8,37 @@ Two implementations:
 
 from __future__ import annotations
 
+import re
 import shutil
 import time
 from pathlib import Path
 from typing import Protocol
 
 from .runner import Runner
+from .validate import ValidationError, validate_path
+
+
+_BACKUP_SUFFIX_RE = re.compile(r"\.anubis-bak\.[0-9]+")
+
+
+def _is_our_backup(path: str, candidate: str) -> bool:
+    """Is `candidate` a backup this tool made of `path`?
+
+    Backup names come out of a directory listing in a webroot the website
+    user owns, and go straight back into a `sudo nine-su` command. We only
+    ever create `<path>.anubis-bak.<unix-timestamp>`, so anything else in
+    the glob is not ours to read or restore from — including a name crafted
+    to break out of the command's quoting.
+    """
+    if not candidate.startswith(f"{path}."):
+        return False
+    if not _BACKUP_SUFFIX_RE.fullmatch(candidate[len(path):]):
+        return False
+    try:
+        validate_path(candidate, field="backup file path")
+    except ValidationError:
+        return False
+    return True
 
 
 class FileOps(Protocol):
@@ -59,7 +84,7 @@ class LocalFileOps:
             key=lambda x: x.stat().st_mtime,
             reverse=True,
         )
-        return [str(c) for c in candidates]
+        return [str(c) for c in candidates if _is_our_backup(path, str(c))]
 
 
 class RemoteFileOps:
@@ -92,4 +117,5 @@ class RemoteFileOps:
     def glob_backups(self, path: str) -> list[str]:
         from .nine_su import nine_su_glob
         pattern = f"{path}.anubis-bak.*"
-        return nine_su_glob(self._user, pattern, self._runner)
+        listing = nine_su_glob(self._user, pattern, self._runner)
+        return [p for p in listing if _is_our_backup(path, p)]

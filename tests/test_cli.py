@@ -4,6 +4,9 @@ import io
 import json
 from contextlib import redirect_stdout, redirect_stderr
 
+import pytest
+
+from conftest import hostile, hostile_metacharacters
 from nine_manage_anubis.runner import FakeRunner
 from nine_manage_anubis.cli import main, build_parser, _resolve_domains
 from nine_manage_anubis.settings import Settings
@@ -452,3 +455,225 @@ def test_settings_provide_defaults(tmp_path, monkeypatch):
     parser = build_parser(settings)
     args = parser.parse_args(["install"])
     assert args.version == "1.30.0"
+
+
+# --- Input validation at the CLI boundary -------------------------------------
+#
+# An interactive user must get a clear message and a non-zero exit, and no
+# sudo command may be built for a rejected value.
+
+def _rejection_code(argv, runner) -> int:
+    """Run expecting rejection, returning the exit code.
+
+    argparse rejects some shapes (a leading dash looks like a flag) before our
+    validators see them; both paths must end in a non-zero exit with nothing
+    executed, which is what the caller asserts.
+    """
+    try:
+        return _run(argv, runner=runner)[0]
+    except SystemExit as e:
+        return int(e.code or 0)
+
+
+METACHARACTERS = hostile_metacharacters("example.com")
+HOSTILE = hostile("example.com")
+
+
+@pytest.mark.parametrize("value", HOSTILE)
+def test_enable_rejects_malformed_domain(value):
+    r = _runner()
+    rc = _rejection_code(["enable", value], runner=r)
+    assert rc != 0
+    assert r.calls == []
+
+
+@pytest.mark.parametrize("value", METACHARACTERS)
+def test_enable_rejection_message_names_value_and_expected_form(value):
+    r = _runner()
+    rc, out, err = _run(["enable", value], runner=r)
+    assert rc != 0
+    assert repr(value) in err
+    assert "expected" in err
+    assert "Traceback" not in err
+
+
+@pytest.mark.parametrize("value", HOSTILE)
+def test_disable_rejects_malformed_domain(value):
+    r = _runner()
+    rc = _rejection_code(["disable", value], runner=r)
+    assert rc != 0
+    assert r.calls == []
+
+
+@pytest.mark.parametrize("value", ["www-anubis; id", "-anubis", "../../root", ""])
+def test_rejects_malformed_anubis_user_flag(value):
+    r = _runner()
+    rc = _rejection_code(["--anubis-user", value, "status"], runner=r)
+    assert rc != 0
+    assert r.calls == []
+
+
+def test_anubis_user_rejection_message_names_value_and_expected_form():
+    r = _runner()
+    rc, out, err = _run(["--anubis-user", "www-anubis; id", "status"], runner=r)
+    assert rc != 0
+    assert "www-anubis; id" in err
+    assert "expected" in err
+
+
+@pytest.mark.parametrize("value", ["1.27.0; id", "-1.27.0", "latest", ""])
+def test_install_rejects_malformed_version_flag(value):
+    r = _runner()
+    rc = _rejection_code(["install", "--version", value], runner=r)
+    assert rc != 0
+    assert r.calls == []
+
+
+def test_install_version_rejection_message_names_value_and_expected_form():
+    r = _runner()
+    rc, out, err = _run(["install", "--version", "1.27.0; id"], runner=r)
+    assert rc != 0
+    assert "1.27.0; id" in err
+    assert "expected" in err
+
+
+@pytest.mark.parametrize("value", ["www-example; id", "-example", ""])
+def test_enable_all_rejects_malformed_user_flag(value):
+    r = _runner()
+    rc = _rejection_code(["enable", "--all", "--user", value], runner=r)
+    assert rc != 0
+    assert r.calls == []
+
+
+def test_status_rejects_malformed_domain_filter():
+    r = _runner()
+    rc, out, err = _run(["status", "--domain", "example.com; id"], runner=r)
+    assert rc != 0
+    assert r.calls == []
+
+
+def test_enable_rejects_whole_batch_when_one_domain_is_malformed():
+    """One bad domain must not let the good ones start touching the host."""
+    r = _runner()
+    rc, out, err = _run(["enable", "example.com", "evil.com; id"], runner=r)
+    assert rc != 0
+    assert "evil.com; id" in err
+    assert r.calls == []
+
+
+def test_enable_all_rejects_malformed_domain_from_vhost_json():
+    """Domains parsed out of nine-manage-vhosts JSON are untrusted too."""
+    hostile = """[
+  {"domain": "evil.com; id", "user": "www-example", "webroot": "/home/www-example/x", "template": "default_letsencrypt_https", "template_variables": {}, "aliases": [], "jobs": []}
+]"""
+    r = _runner(**{"sudo nine-manage-vhosts virtual-host list --json": hostile})
+    rc, out, err = _run(["enable", "--all", "--user", "www-example"], runner=r)
+    assert rc != 0
+    assert "evil.com; id" in err
+    assert not any("virtual-host update" in c for c in r.calls)
+
+
+def test_settings_file_with_malformed_user_is_rejected(tmp_path, monkeypatch):
+    config = tmp_path / "config.json"
+    config.write_text(json.dumps({"anubis_user": "www-anubis; id"}))
+    monkeypatch.setattr(
+        "nine_manage_anubis.settings.default_config_path", lambda: config
+    )
+    rc, out, err = _run(["status"], runner=_runner())
+    assert rc != 0
+    assert "www-anubis; id" in err
+    assert "Traceback" not in err
+
+
+def test_settings_file_with_malformed_version_is_rejected(tmp_path, monkeypatch):
+    config = tmp_path / "config.json"
+    config.write_text(json.dumps({"anubis_version": "1.27.0; id"}))
+    monkeypatch.setattr(
+        "nine_manage_anubis.settings.default_config_path", lambda: config
+    )
+    rc, out, err = _run(["install"], runner=_runner())
+    assert rc != 0
+    assert "1.27.0; id" in err
+
+
+def test_valid_domain_still_enables():
+    """The whitelist must not get in the way of the ordinary case."""
+    r = _runner()
+    rc, out, err = _run(["--dry-run", "enable", "example.com"], runner=r)
+    assert rc == 0
+
+
+def test_leading_dash_domain_reaches_our_validator_after_a_double_dash():
+    """`--` stops argparse eating the leading dash, so the value lands on our
+    validator rather than on argparse's "unrecognized arguments"."""
+    r = _runner()
+    rc, out, err = _run(["enable", "--", "-example.com"], runner=r)
+    assert rc != 0
+    assert "-example.com" in err
+    assert "expected" in err
+    assert r.calls == []
+
+
+def test_leading_dash_user_reaches_our_validator_via_equals_form():
+    r = _runner()
+    rc, out, err = _run(["--anubis-user=-anubis", "status"], runner=r)
+    assert rc != 0
+    assert "-anubis" in err
+    assert "expected" in err
+    assert r.calls == []
+
+
+@pytest.mark.parametrize("argv", [
+    ["--dry-run", "enable", "example.com; id"],
+    ["--dry-run", "disable", "example.com; id"],
+    ["--dry-run", "install", "--version", "1.27.0; id"],
+    ["--dry-run", "upgrade", "--version", "1.27.0; id"],
+])
+def test_dry_run_builds_nothing_for_a_rejected_input(argv):
+    """Dry run is not a way to smuggle a value into a constructed command."""
+    r = _runner()
+    rc, out, err = _run(argv, runner=r)
+    assert rc != 0
+    assert r.calls == []
+    assert "1.27.0; id" not in out
+    assert "example.com; id" not in out
+
+
+def test_json_output_mode_also_rejects():
+    r = _runner()
+    rc, out, err = _run(["--json", "enable", "example.com; id"], runner=r)
+    assert rc != 0
+    assert r.calls == []
+
+
+def test_config_still_reports_a_rejected_config_file(tmp_path, monkeypatch):
+    """A bad config file must not lock you out of the command that repairs it."""
+    config = tmp_path / "config.json"
+    config.write_text(json.dumps({"anubis_user": "www-anubis; id"}))
+    monkeypatch.setattr(
+        "nine_manage_anubis.settings.default_config_path", lambda: config
+    )
+    monkeypatch.setattr(
+        "nine_manage_anubis.cli.default_config_path", lambda: config
+    )
+    rc, out, err = _run(["config"], runner=_runner())
+    assert rc == 1
+    assert "www-anubis; id" in out
+    assert "config --init" in out
+    assert "Traceback" not in err
+
+
+def test_config_init_overwrites_a_rejected_config_file(tmp_path, monkeypatch):
+    config = tmp_path / "config.json"
+    config.write_text(json.dumps({"anubis_user": "www-anubis; id"}))
+    monkeypatch.setattr(
+        "nine_manage_anubis.settings.default_config_path", lambda: config
+    )
+    monkeypatch.setattr(
+        "nine_manage_anubis.cli.default_config_path", lambda: config
+    )
+    rc, out, err = _run(["config", "--init"], runner=_runner())
+    assert rc == 0
+    # The file it wrote is now loadable.
+    from nine_manage_anubis.settings import load_settings
+    assert load_settings(config).anubis_user == "www-anubis"

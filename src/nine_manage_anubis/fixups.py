@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 
 from .fileops import FileOps
+from .validate import validate_filename, validate_path
 
 
 # --- File templates (verbatim from the tested runbook) -----------------------
@@ -132,7 +133,13 @@ class FixupPlan:
 
 
 def _webroot_path(webroot: str, name: str) -> str:
-    return f"{webroot.rstrip('/')}/{name}"
+    """Join a name onto the webroot, proving the result is a safe path.
+
+    Every path FileOps touches comes through here, and RemoteFileOps quotes
+    it into a `sudo nine-su` command — so this is the chokepoint that keeps
+    a name read back out of a webroot file from escaping its quotes.
+    """
+    return validate_path(f"{webroot.rstrip('/')}/{name}", field="webroot path")
 
 
 # --- Detection ---------------------------------------------------------------
@@ -181,7 +188,12 @@ def detect_state(webroot: str, ops: FileOps) -> FixupState:
             r"include_once\s+__DIR__\s*\.\s*'/(.+?)'", chain_content
         )
         if len(includes) >= 2:
-            chain_chained_path = includes[1]
+            # Read back out of the operator's own PHP file — untrusted, and
+            # it gets joined onto the webroot and quoted into a command.
+            chain_chained_path = validate_filename(
+                includes[1],
+                field="chained include in anubis-prepend-chain.php",
+            )
 
     return FixupState(
         user_ini=ui_state,
@@ -271,7 +283,10 @@ def apply(webroot: str, ops: FileOps, dry_run: bool = False) -> FixupPlan:
         ops.write(user_ini_path, text)
     elif p.state.user_ini is UserIniState.PRESENT_PREPEND_OTHER:
         ops.backup(user_ini_path)
-        existing_basename = p.state.existing_prepend_path.rsplit("/", 1)[-1]
+        existing_basename = validate_filename(
+            p.state.existing_prepend_path.rsplit("/", 1)[-1],
+            field="auto_prepend_file in .user.ini",
+        )
         ops.write(chain_path, CHAIN_TEMPLATE.format(existing_basename=existing_basename))
         _set_prepend(ops, user_ini_path, chain_path)
 

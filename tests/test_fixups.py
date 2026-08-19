@@ -7,7 +7,10 @@ Or:       python3 tests/test_fixups.py
 import tempfile
 from pathlib import Path
 
+import pytest
+
 from nine_manage_anubis.fileops import LocalFileOps
+from nine_manage_anubis.validate import ValidationError
 from nine_manage_anubis.fixups import (
     UserIniState,
     HtaccessState,
@@ -283,3 +286,95 @@ if __name__ == "__main__":
                 print(f"  FAIL  {fn.__name__}: {e!r}")
                 raise
     print(f"\n{passed}/{len(fns)} passed")
+
+
+# --- Values read back out of a webroot are untrusted ---------------------------
+#
+# The chained include name and auto_prepend_file target come out of files the
+# website user owns, get joined onto the webroot, and are then quoted into a
+# `sudo nine-su` command. A separator or a quote would escape the webroot.
+
+
+def test_chained_include_with_traversal_is_rejected(tmp_path):
+    w = _webroot(tmp_path)
+    (Path(w) / ".user.ini").write_text(
+        f"auto_prepend_file = {w}/anubis-prepend-chain.php\n"
+    )
+    (Path(w) / "anubis-prepend-chain.php").write_text(
+        "<?php\n"
+        "include_once __DIR__ . '/anubis-origin-shim.php';\n"
+        "include_once __DIR__ . '/../../../etc/passwd';\n"
+    )
+    with pytest.raises(ValidationError) as exc:
+        detect_state(w, _ops())
+    assert "../../../etc/passwd" in str(exc.value)
+
+
+def test_chained_include_with_metacharacters_is_rejected(tmp_path):
+    w = _webroot(tmp_path)
+    (Path(w) / ".user.ini").write_text(
+        f"auto_prepend_file = {w}/anubis-prepend-chain.php\n"
+    )
+    (Path(w) / "anubis-prepend-chain.php").write_text(
+        "<?php\n"
+        "include_once __DIR__ . '/anubis-origin-shim.php';\n"
+        "include_once __DIR__ . '/waf.php; id';\n"
+    )
+    with pytest.raises(ValidationError) as exc:
+        detect_state(w, _ops())
+    assert "waf.php; id" in str(exc.value)
+
+
+def test_auto_prepend_file_with_metacharacters_is_rejected(tmp_path):
+    w = _webroot(tmp_path)
+    (Path(w) / ".user.ini").write_text(
+        "auto_prepend_file = /home/www-example/example.ch/waf.php; id\n"
+    )
+    with pytest.raises(ValidationError):
+        apply(w, _ops(), dry_run=False)
+
+
+def test_webroot_with_metacharacters_is_rejected():
+    with pytest.raises(ValidationError):
+        detect_state("/home/www-example/example.ch; id", _ops())
+
+
+def test_relative_webroot_is_rejected():
+    with pytest.raises(ValidationError):
+        detect_state("example.ch", _ops())
+
+
+def test_wordfence_chaining_still_works(tmp_path):
+    """The ordinary chaining case must survive the whitelist."""
+    w = _webroot(tmp_path)
+    (Path(w) / ".user.ini").write_text(
+        f"auto_prepend_file = {w}/wordfence-waf.php\n"
+    )
+    (Path(w) / "wordfence-waf.php").write_text("<?php\n")
+    apply(w, _ops(), dry_run=False)
+    chain = (Path(w) / "anubis-prepend-chain.php").read_text()
+    assert "wordfence-waf.php" in chain
+    assert detect_state(w, _ops()).chain_chained_path == "wordfence-waf.php"
+
+
+def test_restore_ignores_a_backup_name_we_did_not_create(tmp_path):
+    """Backup names come out of a listing in a webroot the site owner
+    controls. Only `<path>.anubis-bak.<timestamp>` is ours to read back."""
+    from nine_manage_anubis.fileops import LocalFileOps
+
+    w = _webroot(tmp_path)
+    target = Path(w) / ".user.ini"
+    target.write_text("real\n")
+    (Path(w) / ".user.ini.anubis-bak.planted; id").write_text("planted\n")
+    assert LocalFileOps().glob_backups(str(target)) == []
+
+
+def test_restore_finds_a_backup_we_did_create(tmp_path):
+    from nine_manage_anubis.fileops import LocalFileOps
+
+    w = _webroot(tmp_path)
+    target = Path(w) / ".user.ini"
+    target.write_text("real\n")
+    ops = LocalFileOps()
+    bak = ops.backup(str(target))
+    assert ops.glob_backups(str(target)) == [bak]
