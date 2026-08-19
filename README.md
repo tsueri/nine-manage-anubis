@@ -1,5 +1,10 @@
 # nine-manage-anubis
 
+> **Not affiliated with or supported by nine.ch.** This is a third-party tool
+> that automates the Anubis runbook on nine.ch Managed Servers. It is not
+> developed, endorsed, or supported by nine.ch GmbH. For issues, use the
+> [issue tracker](https://github.com/tsueri/nine-manage-anubis/issues).
+
 CLI for managing [Anubis](https://github.com/TecharoHQ/anubis) bot protection on [nine.ch Managed Servers](https://docs.nine.ch/docs/managed-server-services/).
 
 Automates the full Anubis lifecycle: installation, enabling/disabling protection for vhosts (with multisite detection, automated origin fixups, dynamic port discovery), batch operations, upgrades with rolling restart, status reporting, and self-test with automatic rollback on failure.
