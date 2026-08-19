@@ -63,11 +63,12 @@ def test_status_table_vhosts_vertical():
     instances = [_instance("example.ch", 7014, vhosts=["example.ch", "blog.example.ch"])]
     out = format_status(instances)
     lines = out.strip().splitlines()
-    vhost_lines = [l for l in lines if "blog.example.ch" in l]
+    vhost_lines = [line for line in lines if "blog.example.ch" in line]
     assert len(vhost_lines) == 1
-    assert "example.ch" not in vhost_lines[0].split("VHOSTS")[-1] if "VHOSTS" in vhost_lines[0] else True
-    example_lines = [l for l in lines if l.strip().startswith("example.ch") or l.strip().startswith("www-anubis") or "example.ch" in l]
-    first_vhost_line = [l for l in lines if "example.ch" in l and "7014" in l]
+    if "VHOSTS" in vhost_lines[0]:
+        assert "example.ch" not in vhost_lines[0].split("VHOSTS")[-1]
+
+    first_vhost_line = [line for line in lines if "example.ch" in line and "7014" in line]
     assert len(first_vhost_line) == 1
 
 

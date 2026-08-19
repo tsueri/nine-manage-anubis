@@ -205,7 +205,7 @@ def test_binary_version():
 def test_download_binary():
     r = FakeRunner()
     r.responses[_SU] = "Anubis version 1.27.0\n"
-    result = download_binary("www-anubis", "1.27.0", runner=r)
+    download_binary("www-anubis", "1.27.0", runner=r)
     cmd = r.calls[0]
     assert "curl -sLO" in cmd
     assert "anubis-1.27.0-linux-amd64.tar.gz" in cmd

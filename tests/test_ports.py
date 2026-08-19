@@ -16,7 +16,6 @@ from nine_manage_anubis.locking import LockUnavailable
 from nine_manage_anubis.runner import FakeRunner
 from nine_manage_anubis.validate import ValidationError
 from nine_manage_anubis.ports import (
-    AnubisInstance,
     PAIR_STRIDE,
     PortAllocation,
     PORT_RANGE_START,

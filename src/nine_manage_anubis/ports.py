@@ -335,11 +335,10 @@ def discover_instances(
 def _all_used_ports(runner: Runner) -> set[int]:
     listening = get_listening_ports(runner)
     claimed = get_claimed_ports(runner)
-    vhosts = _parse_vhosts_json(runner)
     assigned = {
-        _get_proxy_port(vh)
-        for vh in vhosts
-        if _is_anubis_proxy(vh) and _get_proxy_port(vh) is not None
+        port
+        for vh in _parse_vhosts_json(runner)
+        if _is_anubis_proxy(vh) and (port := _get_proxy_port(vh)) is not None
     }
     return listening | set(claimed.keys()) | assigned
 

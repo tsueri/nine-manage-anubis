@@ -15,5 +15,11 @@ nine-manage-anubis = "nine_manage_anubis.cli:main"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+# The package is fully annotated and mypy-clean, and the marker is what lets
+# anything importing it — including this repo's own test suite — see that
+# rather than treat it as untyped.
+[tool.setuptools.package-data]
+nine_manage_anubis = ["py.typed"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]

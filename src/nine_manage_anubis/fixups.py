@@ -306,8 +306,13 @@ def apply(webroot: str, ops: FileOps, dry_run: bool = False) -> FixupPlan:
         ops.write(user_ini_path, text)
     elif p.state.user_ini is UserIniState.PRESENT_PREPEND_OTHER:
         ops.backup(user_ini_path)
+        # The state carries a path exactly when it is one of the PREPEND_*
+        # states, which its type cannot say. Nothing is assumed of it here:
+        # a missing one arrives at validate_filename as the empty string,
+        # which is the same thing a `auto_prepend_file =` with no value on
+        # the right does, and is rejected the same way.
         existing_basename = validate_filename(
-            p.state.existing_prepend_path.rsplit("/", 1)[-1],
+            (p.state.existing_prepend_path or "").rsplit("/", 1)[-1],
             field="auto_prepend_file in .user.ini",
         )
         ops.write(chain_path, CHAIN_TEMPLATE.format(existing_basename=existing_basename))

@@ -1,7 +1,6 @@
 """Tests for settings.py — config file loading."""
 
 import json
-from pathlib import Path
 
 import pytest
 

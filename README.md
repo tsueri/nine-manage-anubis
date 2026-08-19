@@ -486,6 +486,10 @@ For the full manual runbook, see [docs/runbook.md](docs/runbook.md).
 # Run the test suite (stdlib only)
 python -m pytest -q
 
+# Type check and lint (both clean; a new finding is a regression)
+python -m mypy src/nine_manage_anubis tests
+python -m ruff check src tests
+
 # Install in development mode
 pip install -e .
 

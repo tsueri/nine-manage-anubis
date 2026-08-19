@@ -369,10 +369,10 @@ def cmd_uninstall(
 
     if not dry_run:
         remove_systemd_template(anubis_user, runner=runner)
-        result.steps.append(f"Removed systemd template")
+        result.steps.append("Removed systemd template")
 
         remove_file(anubis_user, f"/home/{anubis_user}/bin/anubis", runner=runner)
-        result.steps.append(f"Removed Anubis binary")
+        result.steps.append("Removed Anubis binary")
 
         remove_user(anubis_user, runner=runner)
         result.steps.append(f"Removed user {anubis_user}")
@@ -519,6 +519,10 @@ def cmd_enable(
             # would stall every other run for nothing.
             claim.release()
 
+        # One stack for the whole command: `enable` unwinds what it created,
+        # and which of the two shapes below created it does not change that.
+        undo_stack: list[UndoStep] = []
+
         if alloc.is_reused:
             result.steps.append(
                 f"Reusing existing Anubis instance for {alloc.reused_from} "
@@ -536,7 +540,6 @@ def cmd_enable(
                 )
 
             if not prepare_only:
-                undo_stack: list[UndoStep] = []
                 try:
                     if not certificate_exists(domain, runner=runner):
                         create_certificate(domain, runner=runner)
@@ -560,12 +563,11 @@ def cmd_enable(
             key_path=key_path_for(anubis_user, domain),
         )
 
-        undo_stack: list[UndoStep] = []
         ops = RemoteFileOps(website_user, runner)
 
         if not cutover_only:
             key_content = generate_key(runner=runner)
-            result.steps.append(f"Generated JWT key")
+            result.steps.append("Generated JWT key")
 
             env_content = generate_env_file(config, policy_file=policy_file)
             result.steps.append(f"Prepared env file ({config.env_path})")
@@ -778,8 +780,8 @@ def _describe_disable(
     result.steps.append(f"This is the last vhost on port {port} — would tear down instance:")
     result.steps.append(f"  Stop + disable {_service(domain)}")
     result.steps.append(f"  Remove {_origin_vhost(domain)}")
-    result.steps.append(f"  Restore fixup files")
-    result.steps.append(f"  Remove env file + key")
+    result.steps.append("  Restore fixup files")
+    result.steps.append("  Remove env file + key")
 
 
 def _tear_down_instance(

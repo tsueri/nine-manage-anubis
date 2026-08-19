@@ -119,7 +119,7 @@ def test_apply_no_prepend_adds_line(tmp_path):
     w = _webroot(tmp_path)
     (Path(w) / ".user.ini").write_text("memory_limit=256M\n")
     (Path(w) / ".htaccess").write_text("# app rules\n")
-    p = apply(w, _ops())
+    apply(w, _ops())
     text = (Path(w) / ".user.ini").read_text()
     assert "memory_limit=256M" in text
     assert "auto_prepend_file" in text

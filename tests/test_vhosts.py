@@ -26,7 +26,6 @@ from nine_manage_anubis.vhosts import (
     VHOST_TIMEOUT,
     PROXY_TEMPLATE,
     ORIGIN_TEMPLATE,
-    DEFAULT_LE_TEMPLATE,
 )
 
 CERT_LIST_OUTPUT = """www.example.ch
