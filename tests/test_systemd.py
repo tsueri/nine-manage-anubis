@@ -1,5 +1,11 @@
 """Tests for systemd.py — service management via nine-su heredoc."""
 
+import posixpath
+
+import pytest
+from conftest import HOSTILE_PATHS
+from shellparse import script_argv, sh_words_after, su_argv, su_script
+
 from nine_manage_anubis.runner import FakeRunner
 from nine_manage_anubis.systemd import (
     daemon_reload,
@@ -18,6 +24,7 @@ from nine_manage_anubis.systemd import (
     binary_exists,
     binary_version,
     download_binary,
+    extract_policy,
     get_latest_version,
 )
 from nine_manage_anubis.config import SYSTEMD_TEMPLATE
@@ -211,3 +218,155 @@ def test_get_latest_version():
                 "| grep -m1 '\"tag_name\"'"] = '"tag_name": "v1.27.0"'
     v = get_latest_version(r)
     assert v == "1.27.0"
+
+
+# --- Quoting -------------------------------------------------------------------
+#
+# Instance names and paths are interpolated into a script the far-side shell
+# re-parses. Paths are outside any whitelist, so quoting is what keeps them
+# from ending the command they sit in.
+
+
+HOSTILE_USER = "www example`id`"
+HOSTILE_INSTANCE = "example.com; id"
+
+
+# Service operations
+
+
+@pytest.mark.parametrize(
+    "call",
+    [enable_service, disable_service, restart_service, is_active],
+)
+def test_service_functions_quote_the_user_and_instance(call):
+    r = FakeRunner()
+    call(HOSTILE_USER, HOSTILE_INSTANCE, runner=r)
+    assert su_argv(r.calls[0]) == ["sudo", "nine-su", HOSTILE_USER]
+    assert f"anubis@{HOSTILE_INSTANCE}.service" in script_argv(r.calls[0])
+
+
+# File operations
+
+
+@pytest.mark.parametrize("path", HOSTILE_PATHS)
+def test_write_env_file_quotes_the_path(path):
+    r = FakeRunner()
+    write_env_file("www-anubis", path, "BIND=:7010\n", runner=r)
+    words = script_argv(r.calls[0])
+    assert posixpath.dirname(path) in words
+    assert path in words
+    assert "BIND=:7010" in su_script(r.calls[0])
+
+
+@pytest.mark.parametrize("path", HOSTILE_PATHS)
+def test_write_key_file_quotes_the_path(path):
+    r = FakeRunner()
+    write_key_file("www-anubis", path, "deadbeef", runner=r)
+    words = script_argv(r.calls[0])
+    assert posixpath.dirname(path) in words
+    # Made writable, written, then chmodded to 600 — the same single argument
+    # each time.
+    assert words.count(path) == 3
+
+
+def test_write_key_file_restricts_the_mode_in_one_round_trip():
+    r = FakeRunner()
+    write_key_file("www-anubis", "/home/www-anubis/k", "deadbeef", runner=r)
+    assert len(r.calls) == 1
+    assert ["chmod", "600", "--", "/home/www-anubis/k"] == script_argv(r.calls[0])[-4:]
+
+
+def test_write_key_file_content_cannot_terminate_its_heredoc():
+    r = FakeRunner()
+    write_key_file("www-anubis", "/home/www-anubis/k", "FILE_EOF\nid", runner=r)
+    assert "FILE_EOF\nid" in su_script(r.calls[0])
+    assert "id" not in script_argv(r.calls[0])
+
+
+@pytest.mark.parametrize("path", HOSTILE_PATHS)
+def test_remove_file_quotes_the_path(path):
+    r = FakeRunner()
+    remove_file("www-anubis", path, runner=r)
+    assert script_argv(r.calls[0]) == ["rm", "-f", "--", path]
+
+
+@pytest.mark.parametrize("path", HOSTILE_PATHS)
+def test_remove_file_hands_a_real_shell_one_path_argument(path):
+    r = FakeRunner()
+    remove_file("www-anubis", path, runner=r)
+    assert sh_words_after(su_script(r.calls[0]), "rm -f -- ") == [path]
+
+
+@pytest.mark.parametrize("path", HOSTILE_PATHS)
+def test_file_exists_quotes_the_path(path):
+    r = FakeRunner()
+    file_exists("www-anubis", path, runner=r)
+    assert path in script_argv(r.calls[0])
+
+
+# Template operations
+
+
+def test_write_systemd_template_quotes_the_user_derived_path():
+    r = FakeRunner()
+    write_systemd_template(HOSTILE_USER, "[Unit]\n", runner=r)
+    path = f"/home/{HOSTILE_USER}/.config/systemd/user/anubis@.service"
+    assert su_argv(r.calls[0]) == ["sudo", "nine-su", HOSTILE_USER]
+    assert path in script_argv(r.calls[0])
+
+
+def test_systemd_template_content_cannot_terminate_its_heredoc():
+    r = FakeRunner()
+    write_systemd_template("www-anubis", "[Unit]\nFILE_EOF\nid", runner=r)
+    assert "FILE_EOF\nid" in su_script(r.calls[0])
+    assert "id" not in script_argv(r.calls[0])
+
+
+@pytest.mark.parametrize("call", [template_exists, remove_systemd_template])
+def test_template_functions_quote_the_user_derived_path(call):
+    r = FakeRunner()
+    call(HOSTILE_USER, runner=r)
+    path = f"/home/{HOSTILE_USER}/.config/systemd/user/anubis@.service"
+    assert path in script_argv(r.calls[0])
+
+
+# Binary operations
+
+
+@pytest.mark.parametrize("call", [binary_exists, binary_version])
+def test_binary_functions_quote_the_user_derived_path(call):
+    r = FakeRunner()
+    call(HOSTILE_USER, runner=r)
+    assert f"/home/{HOSTILE_USER}/bin/anubis" in script_argv(r.calls[0])
+
+
+def test_download_binary_quotes_the_version():
+    # The version reaches here from the config file or the GitHub API, both
+    # of which are validated — quoting is the second line of defence.
+    r = FakeRunner()
+    download_binary("www-anubis", "1.27.0; id", runner=r)
+    words = script_argv(r.calls[0])
+    assert "anubis-1.27.0; id-linux-amd64.tar.gz" in words
+    assert (
+        "https://github.com/TecharoHQ/anubis/releases/download/"
+        "v1.27.0; id/anubis-1.27.0; id-linux-amd64.tar.gz" in words
+    )
+    assert "anubis-1.27.0; id-linux-amd64/bin/anubis" in words
+    assert "anubis-1.27.0; id-linux-amd64" in words
+
+
+@pytest.mark.parametrize("path", HOSTILE_PATHS)
+def test_extract_policy_quotes_the_destination(path):
+    r = FakeRunner()
+    extract_policy("www-anubis", path, runner=r)
+    words = script_argv(r.calls[0])
+    assert posixpath.dirname(path) in words
+    assert path in words
+
+
+def test_extract_policy_quotes_the_scratch_directory():
+    r = FakeRunner()
+    extract_policy(HOSTILE_USER, "/home/www-anubis/policy.yaml", runner=r)
+    words = script_argv(r.calls[0])
+    assert f"/tmp/anubis-extract-{HOSTILE_USER}" in words
+    assert f"/tmp/anubis-extract-{HOSTILE_USER}/data/botPolicies.yaml" in words

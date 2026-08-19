@@ -57,6 +57,7 @@ from .systemd import (
 )
 from .fixups import apply as apply_fixups, restore as restore_fixups
 from .fileops import RemoteFileOps
+from .shell import quote
 from .validate import (
     validate_domain,
     validate_path,
@@ -90,6 +91,22 @@ def _validate_inputs(
         validate_domain(domain)
     if version is not None:
         validate_version(version)
+
+
+def _http_probe(domain: str, port: int, runner: Runner) -> str:
+    """The HTTP status code an instance returns for a loopback probe.
+
+    Every health check asks the same question, so the command is built in one
+    place — including the quoting of the Host header, which carries a domain,
+    and of the URL, which carries a port. The `X-Real-Ip` header keeps Anubis
+    from challenging its own health check.
+    """
+    response = runner(
+        f"curl -s -o /dev/null -w {quote('%{http_code}')} "
+        f"-H {quote('X-Real-Ip: 127.0.0.1')} -H {quote(f'Host: {domain}')} "
+        f"{quote(f'http://localhost:{port}/')}"
+    )
+    return response.strip()
 
 
 @dataclass
@@ -483,12 +500,7 @@ def cmd_upgrade(
                 result.error = f"Health check failed for {inst.domain} (service not active)"
                 return result
             try:
-                response = runner(
-                    f"curl -s -o /dev/null -w '%{{http_code}}' "
-                    f"-H 'X-Real-Ip: 127.0.0.1' -H 'Host: {inst.domain}' "
-                    f"http://localhost:{inst.port}/"
-                )
-                code = response.strip().strip("'")
+                code = _http_probe(inst.domain, inst.port, runner)
                 if code and code[0] in "23":
                     result.steps.append(f"  Health check: active (HTTP {code})")
                 else:
@@ -522,12 +534,7 @@ def cmd_status(
         for inst in instances:
             if inst.is_running:
                 try:
-                    response = runner(
-                        f"curl -s -o /dev/null -w '%{{http_code}}' "
-                        f"-H 'X-Real-Ip: 127.0.0.1' -H 'Host: {inst.domain}' "
-                        f"http://localhost:{inst.port}/"
-                    )
-                    code = response.strip().strip("'")
+                    code = _http_probe(inst.domain, inst.port, runner)
                     health_map[inst.domain] = f"HTTP {code}" if code else "no response"
                 except Exception:
                     health_map[inst.domain] = "error"
@@ -587,12 +594,7 @@ def cmd_selftest(
             continue
         result.steps.append(f"anubis@{inst.domain}.service: active")
         try:
-            response = runner(
-                f"curl -s -o /dev/null -w '%{{http_code}}' "
-                f"-H 'X-Real-Ip: 127.0.0.1' -H 'Host: {inst.domain}' "
-                f"http://localhost:{inst.port}/"
-            )
-            code_str = response.strip().strip("'")
+            code_str = _http_probe(inst.domain, inst.port, runner)
             try:
                 code = int(code_str)
                 ok = code > 0
@@ -656,12 +658,7 @@ def cmd_restart(
                 result.error = f"Health check failed for {inst.domain} (service not active)"
                 return result
             try:
-                response = runner(
-                    f"curl -s -o /dev/null -w '%{{http_code}}' "
-                    f"-H 'X-Real-Ip: 127.0.0.1' -H 'Host: {inst.domain}' "
-                    f"http://localhost:{inst.port}/"
-                )
-                code = response.strip().strip("'")
+                code = _http_probe(inst.domain, inst.port, runner)
                 if code and code[0] in "23":
                     result.steps.append(f"  Health check: active (HTTP {code})")
                 else:

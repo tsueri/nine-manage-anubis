@@ -6,6 +6,7 @@ the broken -c pattern.
 """
 
 import pytest
+from shellparse import argv, script_argv
 
 from nine_manage_anubis.runner import FakeRunner
 from nine_manage_anubis.validate import ValidationError
@@ -93,9 +94,9 @@ def _runner_with_data(**overrides) -> FakeRunner:
             "/home/www-anubis/.config/anubis/example.ch.env\n"
             "/home/www-anubis/.config/anubis/app.example.ch.env\n"
         ),
-        _su_key("cat '/home/www-anubis/.config/anubis/test.example.ch.env'"): ENV_TEST,
-        _su_key("cat '/home/www-anubis/.config/anubis/example.ch.env'"): ENV_EXAMPLE,
-        _su_key("cat '/home/www-anubis/.config/anubis/app.example.ch.env'"): ENV_DEMOVOX,
+        _su_key("cat -- /home/www-anubis/.config/anubis/test.example.ch.env"): ENV_TEST,
+        _su_key("cat -- /home/www-anubis/.config/anubis/example.ch.env"): ENV_EXAMPLE,
+        _su_key("cat -- /home/www-anubis/.config/anubis/app.example.ch.env"): ENV_DEMOVOX,
         _su_key("export XDG_RUNTIME_DIR"): "active",
         _su_key("/home/www-anubis/bin/anubis --version"): "Anubis version 1.27.0\n",
     }
@@ -349,7 +350,7 @@ def test_allocate_for_domain_with_existing_env_file():
             "/home/www-anubis/.config/anubis/app.example.ch.env\n"
             "/home/www-anubis/.config/anubis/example.com.env\n"
         ),
-        _su_key("cat '/home/www-anubis/.config/anubis/example.com.env'"): env_example,
+        _su_key("cat -- /home/www-anubis/.config/anubis/example.com.env"): env_example,
     })
     alloc = allocate_for_domain("example.com", r)
     assert not alloc.is_reused
@@ -381,7 +382,7 @@ def test_find_prepared_port_for_webroot():
         _su_key("ls ~/.config/anubis/*.env 2>/dev/null"): (
             "/home/www-anubis/.config/anubis/site-a.ch.env\n"
         ),
-        _su_key("cat '/home/www-anubis/.config/anubis/site-a.ch.env'"): env_a,
+        _su_key("cat -- /home/www-anubis/.config/anubis/site-a.ch.env"): env_a,
     })
     port = find_prepared_port_for_webroot("/home/www-example/shared", runner=r)
     assert port == 7020
@@ -424,7 +425,7 @@ def test_allocate_for_domain_reuses_prepared_sibling():
         _su_key("ls ~/.config/anubis/*.env 2>/dev/null"): (
             "/home/www-anubis/.config/anubis/site-a.ch.env\n"
         ),
-        _su_key("cat '/home/www-anubis/.config/anubis/site-a.ch.env'"): env_a,
+        _su_key("cat -- /home/www-anubis/.config/anubis/site-a.ch.env"): env_a,
     })
     # site-b.ch shares webroot with site-a.ch which is already behind Anubis
     alloc = allocate_for_domain("site-b.ch", r)
@@ -455,7 +456,7 @@ def test_allocate_for_domain_reuses_prepared_sibling_not_yet_cut_over():
         _su_key("ls ~/.config/anubis/*.env 2>/dev/null"): (
             "/home/www-anubis/.config/anubis/site-a.ch.env\n"
         ),
-        _su_key("cat '/home/www-anubis/.config/anubis/site-a.ch.env'"): env_a,
+        _su_key("cat -- /home/www-anubis/.config/anubis/site-a.ch.env"): env_a,
     })
     # Neither is behind Anubis, but site-a.ch has an env file
     alloc = allocate_for_domain("site-b.ch", r)
@@ -574,7 +575,7 @@ def _env_scan_runner(env_content: str, stem: str = "example.com") -> FakeRunner:
         "test -d /home/www-anubis/.config/anubis && echo yes || echo no": "yes",
         _su_key("ls ~/.config/anubis/*.env 2>/dev/null"):
             f"/home/www-anubis/.config/anubis/{stem}.env\n",
-        _su_key(f"cat '/home/www-anubis/.config/anubis/{stem}.env'"): env_content,
+        _su_key(f"cat -- /home/www-anubis/.config/anubis/{stem}.env"): env_content,
     })
 
 
@@ -611,7 +612,7 @@ def test_get_claimed_ports_ignores_env_file_without_bind():
         "test -d /home/www-anubis/.config/anubis && echo yes || echo no": "yes",
         _su_key("ls ~/.config/anubis/*.env 2>/dev/null"):
             "/home/www-anubis/.config/anubis/example.com.env\n",
-        _su_key("cat '/home/www-anubis/.config/anubis/example.com.env'"):
+        _su_key("cat -- /home/www-anubis/.config/anubis/example.com.env"):
             "TARGET_HOST=origin-example.com\n",
     })
     assert get_claimed_ports(r) == {}
@@ -648,3 +649,56 @@ def test_parse_vhosts_json_keeps_out_of_range_proxyport():
     vhosts = _parse_vhosts_json(r)
     assert _get_proxy_port(vhosts[0]) == 3000
     assert discover_instances(r) == []
+
+
+# --- Quoting ------------------------------------------------------------------
+#
+# Discovery reads back user names, env-file paths and instance domains and puts
+# them straight into further commands. Every one of them clears a validator
+# first (see the rejection tests above), so quoting here is the second line of
+# defence: what these tests pin is that discovery builds its commands through
+# the quoting wrappers rather than hand-rolling a script of its own.
+
+
+def test_env_file_read_goes_through_the_quoting_wrapper():
+    r = _runner_with_data()
+    get_claimed_ports(r)
+    reads = [c for c in r.calls if "cat" in c]
+    assert reads
+    for cmd in reads:
+        words = script_argv(cmd)
+        assert words[:2] == ["cat", "--"]
+        assert words[2].endswith(".env")
+
+
+def test_env_file_that_vanished_is_skipped_rather_than_fatal():
+    # The listing and the read are two round trips; an instance torn down in
+    # between must not abort discovery.
+    r = _runner_with_data(
+        **{
+            _su_key("cat -- /home/www-anubis/.config/anubis/example.ch.env"): (
+                "__NINE_SU_FILE_NOT_FOUND__"
+            )
+        }
+    )
+    claimed = get_claimed_ports(r)
+    assert 7014 not in claimed
+    assert 7010 in claimed
+
+
+def test_anubis_config_dir_check_quotes_the_path():
+    r = _runner_with_data()
+    _find_anubis_users(r)
+    checks = [c for c in r.calls if c.startswith("test -d ")]
+    assert checks
+    for cmd in checks:
+        assert "/.config/anubis" in argv(cmd)[2]
+
+
+def test_service_state_and_version_reuse_the_systemd_wrappers():
+    # Two copies of the same script drift apart, and the copy that drifts is
+    # the one nobody quoted.
+    r = _runner_with_data()
+    discover_instances(r)
+    assert any("is-active anubis@example.ch.service || true" in c for c in r.calls)
+    assert any("/home/www-anubis/bin/anubis --version" in c for c in r.calls)

@@ -14,7 +14,9 @@ import re
 from dataclasses import dataclass, field
 
 from .runner import Runner, SubprocessRunner
-from .nine_su import nine_su, nine_su_systemd
+from .nine_su import nine_su, nine_su_read_file
+from .shell import quote
+from .systemd import binary_version, is_active
 from .validate import (
     MAX_TCP_PORT,
     MIN_TCP_PORT,
@@ -166,7 +168,9 @@ def _find_anubis_users(runner: Runner) -> list[str]:
             validate_system_user(user, field="home directory user")
         except ValidationError:
             continue
-        check = runner(f"test -d /home/{user}/.config/anubis && echo yes || echo no")
+        check = runner(
+            f"test -d {quote(f'/home/{user}/.config/anubis')} && echo yes || echo no"
+        )
         if check.strip() == "yes":
             users.append(user)
     return users
@@ -193,7 +197,12 @@ def get_claimed_ports(runner: Runner = SubprocessRunner()) -> dict[int, tuple[st
                 domain = domain[: -len(".env")]
             validate_domain(domain, field="instance domain from env file")
             validate_path(env_path, field="env file path")
-            content = nine_su(user, f"cat '{env_path}'", runner)
+            # The listing and the read are separate round trips, so an
+            # instance torn down in between leaves a path that no longer
+            # exists — not a reason to abort the whole scan.
+            content = nine_su_read_file(user, env_path, runner)
+            if content is None:
+                continue
             env = _parse_env_file(content)
             bind = env.get("BIND", "")
             port_match = re.match(r":(\d+)", bind)
@@ -218,20 +227,12 @@ def get_claimed_ports(runner: Runner = SubprocessRunner()) -> dict[int, tuple[st
 def _get_service_state(
     user: str, instance: str, runner: Runner
 ) -> str:
-    # `systemctl is-active` exits 3 for anything that isn't active — see
-    # systemd.is_active for why the `|| true` is load-bearing.
-    result = nine_su_systemd(
-        user,
-        f"systemctl --user is-active anubis@{instance}.service || true",
-        runner,
-    )
-    result = result.strip()
-    return result if result else "not-found"
+    """The unit state, with silence reported as ``not-found``.
 
-
-def _get_binary_version(user: str, runner: Runner) -> str:
-    result = nine_su(user, f"/home/{user}/bin/anubis --version 2>&1 || true", runner)
-    return result.strip()
+    Delegates to the systemd wrapper rather than repeating its script: a second
+    copy is a second place the quoting has to be right.
+    """
+    return is_active(user, instance, runner=runner) or "not-found"
 
 
 def discover_instances(
@@ -257,7 +258,7 @@ def discover_instances(
         metrics_port = port + 1
         state = _get_service_state(user, domain, runner)
         vhost_list = port_vhosts.get(port, [])
-        ver = _get_binary_version(user, runner)
+        ver = binary_version(user, runner=runner)
         instances.append(
             AnubisInstance(
                 domain=domain,

@@ -30,3 +30,18 @@ def hostile(base: str) -> list[str]:
 # (a leading dash looks like a flag, so argparse rejects it first).
 def hostile_metacharacters(base: str) -> list[str]:
     return [v for v in hostile(base) if v and not v.startswith("-")]
+
+
+# Webroots and paths are not covered by a whitelist — nine-manage-vhosts may
+# report anything a filesystem allows — so the quoting, not the shape, is what
+# keeps them harmless. One list shared by every wrapper's quoting tests.
+HOSTILE_PATHS = [
+    "/home/www example/my site",
+    "/home/www-example/it's mine",
+    "/home/www-example/`id`",
+    "/home/www-example/$(id)",
+    "/home/www-example/x; id",
+    "/home/www-example/x\nid",
+    "/home/www-example/$HOME",
+    "/home/www-example/*",
+]

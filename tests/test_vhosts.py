@@ -1,5 +1,9 @@
 """Tests for vhosts.py — nine-manage-vhosts wrapper."""
 
+import pytest
+from conftest import HOSTILE_PATHS
+from shellparse import argv, sh_words_after
+
 from nine_manage_anubis.runner import FakeRunner
 from nine_manage_anubis.vhosts import (
     create_vhost,
@@ -179,3 +183,119 @@ def test_remove_user():
     r = FakeRunner()
     remove_user("www-anubis", runner=r)
     assert "user remove www-anubis" in r.calls[0]
+
+
+# --- Quoting -------------------------------------------------------------------
+#
+# Domains and users clear a whitelist before they get here, but webroots and
+# template variables do not: nine-manage-vhosts reports whatever the operator
+# configured, and a template variable is an arbitrary key/value pair. So the
+# command these functions build is asserted word-for-word, as a shell would
+# split it — a value that escaped its quotes shows up as several words.
+
+
+@pytest.mark.parametrize("webroot", HOSTILE_PATHS)
+def test_create_vhost_quotes_a_hostile_webroot(webroot):
+    r = FakeRunner()
+    create_vhost("example.com", "www-example", webroot=webroot, runner=r)
+    assert f"--webroot={webroot}" in argv(r.calls[0])
+
+
+@pytest.mark.parametrize("webroot", HOSTILE_PATHS)
+def test_create_vhost_hands_a_real_shell_one_webroot_argument(webroot):
+    # shlex splits and unquotes but never expands, so it cannot tell whether a
+    # `$( )` would have run. A real /bin/sh can.
+    r = FakeRunner()
+    create_vhost("example.com", "www-example", webroot=webroot, runner=r)
+    words = sh_words_after(r.calls[0], "sudo nine-manage-vhosts virtual-host create ")
+    assert f"--webroot={webroot}" in words
+    assert len(words) == 4  # domain, --user, --template, --webroot
+
+
+@pytest.mark.parametrize("webroot", HOSTILE_PATHS)
+def test_create_origin_vhost_quotes_a_hostile_webroot(webroot):
+    r = FakeRunner()
+    create_origin_vhost("example.com", "www-example", webroot, runner=r)
+    assert f"--webroot={webroot}" in argv(r.calls[0])
+
+
+HOSTILE_TEMPLATE_VARIABLES = [
+    ("PHP_VERSION", "8.2; id"),
+    ("PHP_VERSION", "8.2`id`"),
+    ("PHP_VERSION", "8.2$(id)"),
+    ("PHP_VERSION", "8 2"),
+    ("PHP_VERSION", "it's 8.2"),
+    ("PHP VERSION", "8.2"),
+    ("PHP_VERSION`id`", "8.2"),
+]
+
+
+@pytest.mark.parametrize("key,value", HOSTILE_TEMPLATE_VARIABLES)
+def test_create_vhost_quotes_a_hostile_template_variable(key, value):
+    r = FakeRunner()
+    create_vhost("example.com", "www-example", template_variables={key: value}, runner=r)
+    assert f"--template-variable={key}={value}" in argv(r.calls[0])
+
+
+@pytest.mark.parametrize("key,value", HOSTILE_TEMPLATE_VARIABLES)
+def test_create_vhost_hands_a_real_shell_one_template_variable_argument(key, value):
+    r = FakeRunner()
+    create_vhost("example.com", "www-example", template_variables={key: value}, runner=r)
+    words = sh_words_after(r.calls[0], "sudo nine-manage-vhosts virtual-host create ")
+    assert f"--template-variable={key}={value}" in words
+    assert len(words) == 4  # domain, --user, --template, --template-variable
+
+
+@pytest.mark.parametrize("key,value", HOSTILE_TEMPLATE_VARIABLES)
+def test_update_vhost_quotes_a_hostile_template_variable(key, value):
+    r = FakeRunner()
+    update_vhost("example.com", template_variables={key: value}, runner=r)
+    assert f"--template-variable={key}={value}" in argv(r.calls[0])
+
+
+def test_create_vhost_quotes_domain_user_and_template():
+    r = FakeRunner()
+    create_vhost("example.com; id", "www example", template="tpl`id`", runner=r)
+    words = argv(r.calls[0])
+    assert "example.com; id" in words
+    assert "--user=www example" in words
+    assert "--template=tpl`id`" in words
+
+
+@pytest.mark.parametrize(
+    "call", [remove_vhost, remove_origin_vhost, switch_to_default]
+)
+def test_domain_only_functions_quote_the_domain(call):
+    r = FakeRunner()
+    call("example.com; id", runner=r)
+    words = argv(r.calls[0])
+    assert any(w.endswith("example.com; id") for w in words)
+    assert "id" not in words
+
+
+def test_certificate_functions_quote_the_domain():
+    r = FakeRunner()
+    create_certificate("example.com; id", runner=r)
+    assert "--virtual-host=example.com; id" in argv(r.calls[0])
+    r = FakeRunner()
+    remove_certificate("example.com; id", runner=r)
+    assert "--virtual-host=example.com; id" in argv(r.calls[0])
+
+
+@pytest.mark.parametrize("call", [create_user, remove_user])
+def test_user_functions_quote_the_name(call):
+    r = FakeRunner()
+    call("www example`id`", runner=r)
+    assert "www example`id`" in argv(r.calls[0])
+
+
+def test_switch_to_proxy_passes_the_port_as_a_word():
+    r = FakeRunner()
+    switch_to_proxy("example.com", 7010, runner=r)
+    assert "--template-variable=PROXYPORT=7010" in argv(r.calls[0])
+
+
+def test_no_notify_stays_a_flag():
+    r = FakeRunner()
+    create_vhost("example.com", "www-example", no_notify=True, runner=r)
+    assert "--no-notify-services" in argv(r.calls[0])

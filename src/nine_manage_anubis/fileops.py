@@ -115,7 +115,10 @@ class RemoteFileOps:
         return nine_su_backup(self._user, path, self._runner)
 
     def glob_backups(self, path: str) -> list[str]:
-        from .nine_su import nine_su_glob
-        pattern = f"{path}.anubis-bak.*"
-        listing = nine_su_glob(self._user, pattern, self._runner)
+        from .nine_su import nine_su_glob_prefix
+        # A prefix, not a pattern: the timestamp is the only part that varies,
+        # so the appended `*` is the only wildcard the far-side shell gets.
+        listing = nine_su_glob_prefix(
+            self._user, f"{path}.anubis-bak.", self._runner
+        )
         return [p for p in listing if _is_our_backup(path, p)]

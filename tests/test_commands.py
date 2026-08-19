@@ -3,9 +3,11 @@
 import pytest
 
 from conftest import hostile
+from shellparse import argv
 from nine_manage_anubis.runner import FakeRunner
 from nine_manage_anubis.validate import ValidationError
 from nine_manage_anubis.commands import (
+    _http_probe,
     cmd_install,
     cmd_uninstall,
     cmd_enable,
@@ -47,7 +49,7 @@ def _base_runner(**overrides) -> FakeRunner:
         "ls -d /home/www-*/ 2>/dev/null": "/home/www-anubis/\n",
         "test -d /home/www-anubis/.config/anubis && echo yes || echo no": "yes",
         _SU + "ls ~/.config/anubis/*.env 2>/dev/null": "/home/www-anubis/.config/anubis/test.example.ch.env\n",
-        _SU + "cat '/home/www-anubis/.config/anubis/test.example.ch.env'": "BIND=:7010\nMETRICS_BIND=:7011\nTARGET_HOST=origin-test.example.ch\n",
+        _SU + "cat -- /home/www-anubis/.config/anubis/test.example.ch.env": "BIND=:7010\nMETRICS_BIND=:7011\nTARGET_HOST=origin-test.example.ch\n",
         _SU + "export XDG_RUNTIME_DIR": "active",
         _SU + "/home/www-anubis/bin/anubis --version": "Anubis version 1.27.0\n",
         _SU + "test -f": "yes\n",
@@ -260,7 +262,7 @@ def test_disable_not_last_vhost():
         "sudo nine-manage-vhosts virtual-host list --json": vhosts,
         "ss -tlnp": "LISTEN 0 4096 0.0.0.0:7014 0.0.0.0:* users:((\"anubis\",pid=1,fd=3))\n",
         _SU + "ls ~/.config/anubis/*.env 2>/dev/null": "/home/www-anubis/.config/anubis/example.ch.env\n",
-        _SU + "cat '/home/www-anubis/.config/anubis/example.ch.env'": "BIND=:7014\nMETRICS_BIND=:7015\nTARGET_HOST=origin-example.ch\n",
+        _SU + "cat -- /home/www-anubis/.config/anubis/example.ch.env": "BIND=:7014\nMETRICS_BIND=:7015\nTARGET_HOST=origin-example.ch\n",
     })
     result = cmd_disable("example.ch", runner=r)
     assert result.success
@@ -502,7 +504,7 @@ def test_enable_reused_webroot_rollback_on_cutover_failure():
         "sudo nine-manage-vhosts virtual-host list --json": vhosts,
         "ss -tlnp": "LISTEN 0 4096 0.0.0.0:7014 0.0.0.0:* users:((\"anubis\",pid=1,fd=3))\n",
         _SU + "ls ~/.config/anubis/*.env 2>/dev/null": "/home/www-anubis/.config/anubis/example.ch.env\n",
-        _SU + "cat '/home/www-anubis/.config/anubis/example.ch.env'": "BIND=:7014\nMETRICS_BIND=:7015\nTARGET_HOST=origin-example.ch\n",
+        _SU + "cat -- /home/www-anubis/.config/anubis/example.ch.env": "BIND=:7014\nMETRICS_BIND=:7015\nTARGET_HOST=origin-example.ch\n",
     })
 
     def failing_runner(cmd: str) -> str:
@@ -535,7 +537,7 @@ def test_enable_reuse_creates_certificate_if_missing():
         "sudo nine-manage-vhosts certificate list": cert_list_without_sp_studen,
         "ss -tlnp": "LISTEN 0 4096 0.0.0.0:7014 0.0.0.0:* users:((\"anubis\",pid=1,fd=3))\n",
         _SU + "ls ~/.config/anubis/*.env 2>/dev/null": "/home/www-anubis/.config/anubis/example.ch.env\n",
-        _SU + "cat '/home/www-anubis/.config/anubis/example.ch.env'": "BIND=:7014\nMETRICS_BIND=:7015\nTARGET_HOST=origin-example.ch\n",
+        _SU + "cat -- /home/www-anubis/.config/anubis/example.ch.env": "BIND=:7014\nMETRICS_BIND=:7015\nTARGET_HOST=origin-example.ch\n",
     })
 
     cert_commands = []
@@ -700,3 +702,43 @@ def test_valid_input_still_works():
     r = _base_runner()
     result = cmd_enable("example.com", runner=r, dry_run=True)
     assert result.success
+
+
+# --- HTTP probe ---------------------------------------------------------------
+#
+# Every health check probes the instance with the same curl command. It is
+# built once, so the Host header and the URL are quoted once.
+
+
+def test_http_probe_returns_the_status_code():
+    r = FakeRunner({"curl -s -o /dev/null -w '%{http_code}'": "200"})
+    assert _http_probe("example.com", 7010, r) == "200"
+
+
+def test_http_probe_quotes_the_host_header_and_url():
+    r = FakeRunner()
+    _http_probe("example.com; id", 7010, r)
+    words = argv(r.calls[0])
+    assert "Host: example.com; id" in words
+    assert "http://localhost:7010/" in words
+    assert "id" not in words
+
+
+def test_http_probe_asks_for_the_status_code_only():
+    r = FakeRunner()
+    _http_probe("example.com", 7010, r)
+    words = argv(r.calls[0])
+    assert words[:2] == ["curl", "-s"]
+    assert "%{http_code}" in words
+    assert "X-Real-Ip: 127.0.0.1" in words
+
+
+def test_every_health_check_uses_the_same_probe():
+    for command in (cmd_status, cmd_selftest, cmd_restart, cmd_upgrade):
+        r = _base_runner()
+        kwargs = {"health": True} if command is cmd_status else {}
+        command(runner=r, **kwargs)
+        probes = [c for c in r.calls if c.startswith("curl -s -o /dev/null")]
+        assert probes, f"{command.__name__} did not probe"
+        assert all(p == probes[0] for p in probes)
+        assert "'Host: test.example.ch'" in probes[0]
