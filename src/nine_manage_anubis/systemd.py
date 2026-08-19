@@ -120,13 +120,13 @@ def remove_systemd_template(user: str, runner: Runner = SubprocessRunner()) -> N
 
 
 def write_env_file(user: str, path: str, content: str, runner: Runner = SubprocessRunner()) -> None:
-    nine_su_write_file(user, path, content, runner)
+    # Owner-only like the key: not a secret itself, but it names the key's path
+    # and the ports the instance listens on.
+    nine_su_write_file(user, path, content, runner, owner_only=True)
 
 
 def write_key_file(user: str, path: str, key_content: str, runner: Runner = SubprocessRunner()) -> None:
-    # 600 in the same round trip: a signing key must not sit at the default
-    # mode between two nine-su calls.
-    nine_su_write_file(user, path, key_content, runner, mode="600")
+    nine_su_write_file(user, path, key_content, runner, owner_only=True)
 
 
 def remove_file(user: str, path: str, runner: Runner = SubprocessRunner()) -> None:

@@ -151,7 +151,7 @@ def test_write_key_file():
     r = FakeRunner()
     write_key_file("www-anubis", "/home/www-anubis/.config/anubis/test.key", "abc123", runner=r)
     cmd = r.calls[0]
-    assert "chmod 600" in cmd
+    assert "umask 177" in cmd
     assert "abc123" in cmd
 
 
@@ -288,16 +288,20 @@ def test_write_key_file_quotes_the_path(path):
     write_key_file("www-anubis", path, "deadbeef", runner=r)
     words = script_argv(r.calls[0])
     assert posixpath.dirname(path) in words
-    # Made writable, written, then chmodded to 600 — the same single argument
-    # each time.
-    assert words.count(path) == 3
+    # Any leftover removed, then written — the same single argument each time.
+    assert words.count(path) == 2
 
 
-def test_write_key_file_restricts_the_mode_in_one_round_trip():
+@pytest.mark.parametrize("write", [write_env_file, write_key_file])
+def test_the_instances_own_files_are_restricted_in_one_round_trip(write):
+    # One round trip, because a second one is a window: between two nine-su
+    # calls the file sits on disk at whatever the host's umask allowed. Where
+    # inside the script the mode is settled is test_nine_su's business; that
+    # there is only one script is this one's.
     r = FakeRunner()
-    write_key_file("www-anubis", "/home/www-anubis/k", "deadbeef", runner=r)
+    write("www-anubis", "/home/www-anubis/.config/anubis/example.com", "x\n", runner=r)
     assert len(r.calls) == 1
-    assert ["chmod", "600", "--", "/home/www-anubis/k"] == script_argv(r.calls[0])[-4:]
+    assert "umask 177" in su_script(r.calls[0]).splitlines()
 
 
 @pytest.mark.parametrize("terminator", TERMINATORS)

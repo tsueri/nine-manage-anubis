@@ -462,6 +462,8 @@ Anubis sits between two Apache vhosts. The public vhost proxies to Anubis; Anubi
 
 **Multisite reuse**: when `enable` detects that a domain's webroot already has an Anubis instance, it reuses that port — no new env file, key, or service instance. All domains sharing a webroot proxy to the same Anubis port.
 
+**Instance files**: an instance's env file and signing key are created 0600, in a `~/.config/anubis` the CLI creates if it isn't there. The mode is decided before the content is written rather than chmodded afterwards, so the key is never on disk readable by another user, not even for the length of a write. A file already sitting at either path is replaced; one that can't be replaced — owned by another user, say — fails the write instead of being written into. Webroot files (`.htaccess`, `.user.ini`, the PHP shim) keep the permissions their owner gave them.
+
 **Rollback**: if `enable` fails after making changes, the CLI undoes every step in reverse order (switch vhost back, remove origin vhost, restore fixup files, remove env/key, disable service).
 
 **Failures and timeouts**: a failing external command is reported as the program, its exit code and its stderr — never as the command string, which can carry a freshly generated signing key. Every command runs under a timeout (60s by default; longer for a binary download, a certificate request or a service change), and overrunning it produces a `timed out after Ns` error naming the operation instead of a run that hangs with no output.

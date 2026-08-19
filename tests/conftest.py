@@ -1,10 +1,22 @@
 """Shared test fixtures and helpers."""
 
+import os
+import stat
 import sys
 from pathlib import Path
 
 # Ensure src/ is importable without installation.
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+
+
+# The website user a webroot belongs to — the account nine-su switches to, and
+# the one a write runs as.
+USER = "www-example"
+
+
+def mode_of(path: Path) -> int:
+    """The permission bits of ``path`` — what other users on the box may do with it."""
+    return stat.S_IMODE(os.stat(path).st_mode)
 
 
 def hostile(base: str) -> list[str]:

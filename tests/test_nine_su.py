@@ -89,6 +89,44 @@ def test_write_file_delivers_the_content_verbatim():
     assert "a 'b' `c`\n$(d)" in su_script(r.calls[0])
 
 
+def test_an_owner_only_write_decides_the_mode_before_the_content_lands():
+    # A chmod *after* the redirect is a window: the file is on disk, complete,
+    # at whatever the host's umask allowed, until the next command runs. For a
+    # signing key that window is the whole vulnerability. So the leftover is
+    # removed and the umask set first, leaving a file the redirect creates
+    # already restricted.
+    r = FakeRunner()
+    nine_su_write_file("www-example", "/home/www-example/k", "deadbeef\n", r, owner_only=True)
+    lines = su_script(r.calls[0]).splitlines()
+    write = next(i for i, line in enumerate(lines) if line.startswith("cat > "))
+    assert "rm -f -- /home/www-example/k || exit 1" in lines[:write]
+    assert "umask 177" in lines[:write]
+
+
+def test_an_owner_only_write_is_the_last_thing_its_script_does():
+    # The other half of the claim above, and the half a finished file cannot
+    # show: a mode of 0600 says nothing about how it got there. Nothing follows
+    # the content, so nothing *could* have tightened the mode late.
+    r = FakeRunner()
+    nine_su_write_file("www-example", "/home/www-example/k", "deadbeef\n", r, owner_only=True)
+    lines = su_script(r.calls[0]).splitlines()
+    write = next(i for i, line in enumerate(lines) if line.startswith("cat > "))
+    delimiter = lines[write].split("<<'")[1].rstrip("'")
+    assert lines[-1] == delimiter, "a command follows the write; the mode is set too late"
+
+
+def test_a_plain_write_leaves_the_files_permissions_to_its_owner():
+    # A webroot file is the website user's, not ours: the redirect needs u+w and
+    # nothing more. Narrowing one to 0600, or replacing it, would break the site
+    # whose file it is.
+    r = FakeRunner()
+    nine_su_write_file("www-example", "/home/www-example/webroot/.htaccess", "x\n", r)
+    script = su_script(r.calls[0])
+    assert "chmod u+w" in script
+    assert "umask" not in script
+    assert "rm -f" not in script
+
+
 @pytest.mark.parametrize("terminator", TERMINATORS)
 def test_write_file_content_cannot_terminate_its_heredoc(terminator):
     # Webroot files are attacker-controlled: restoring one whose content holds

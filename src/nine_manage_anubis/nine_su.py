@@ -35,6 +35,9 @@ _SU_DELIMITER_PREFIX = "NINE_SU_EOF"
 _FILE_DELIMITER_PREFIX = "FILE_EOF"
 _NOT_FOUND = "__NINE_SU_FILE_NOT_FOUND__"
 
+# The mode of a file no other user on the box has any business reading.
+_OWNER_ONLY = 0o600
+
 
 def nine_su(
     user: str,
@@ -87,28 +90,60 @@ def nine_su_write_file(
     path: str,
     content: str,
     runner: Runner,
-    mode: str | None = None,
+    *,
+    owner_only: bool = False,
 ) -> None:
     """Write a file as another user. Creates parent dirs if needed.
 
-    Handles read-only files (e.g. .htaccess at 444) by temporarily
-    granting write permission before the redirect. ``mode`` chmods the file
-    afterwards, in the same round trip — for a key file, which must never
-    exist at the default mode even briefly.
+    ``owner_only`` is for the files that belong to an Anubis instance rather
+    than to a website — the signing key, and the env file that names the key's
+    path and the instance's ports. No other user on the box may read either,
+    and not for an instant: the mode is settled before the content lands, never
+    chmodded afterwards. See :func:`_restrict_to_owner`.
 
-    Every file this tool writes goes through here, so the heredoc and the
-    quoting around it have a single home.
+    Otherwise the file's permissions stay its owner's business — a webroot file
+    belongs to the website user — and only the write permission the redirect
+    needs is granted, for the read-only ``.htaccess`` at 444.
+
+    Every file this tool writes goes through here, so the heredoc, the quoting
+    and the mode have a single home.
     """
-    lines = [
-        mkdir_parent(path),
-        f"chmod u+w -- {quote(path)} 2>/dev/null || true",
-        heredoc(f"cat > {quote(path)}", content, _FILE_DELIMITER_PREFIX),
-    ]
-    if mode is not None:
-        lines.append(f"chmod {quote(mode)} -- {quote(path)}")
+    lines = [mkdir_parent(path)]
+    if owner_only:
+        lines.extend(_restrict_to_owner(path))
+    else:
+        lines.append(f"chmod u+w -- {quote(path)} 2>/dev/null || true")
+    # Last, so that no command follows the content and no window opens after it.
+    lines.append(heredoc(f"cat > {quote(path)}", content, _FILE_DELIMITER_PREFIX))
     # The path names the operation; the content never does. A key file's path
     # is fine to print, its content is the thing this must not leak.
     nine_su(user, "\n".join(lines), runner, what=f"writing {path}")
+
+
+def _restrict_to_owner(path: str) -> list[str]:
+    """Script lines leaving the redirect that follows them nothing but a new file.
+
+    A redirect sets no mode on a file that already exists: truncating one leaves
+    its permissions, and its owner, as they were. So a leftover from an earlier
+    run is removed rather than written into, and what the redirect then creates
+    is a new file, whose mode comes from the umask — at creation, so there is no
+    instant at which the file exists and is readable. A chmod afterwards could
+    not say that, and a chmod before only covers the file that is already there.
+
+    Removing is also the loud option, and the one thing here that must be loud:
+    a leftover we cannot remove is one that is not ours — owned by another user,
+    or in a directory we cannot write — and writing a signing key into a file
+    belonging to someone else is the failure this whole function exists to
+    prevent. The script stops instead.
+
+    The umask is set after the parent directory is created, so a config
+    directory shared with an existing instance keeps its own mode. Nothing runs
+    after the redirect, so it needs no undoing.
+    """
+    return [
+        f"rm -f -- {quote(path)} || exit 1",
+        f"umask {0o777 & ~_OWNER_ONLY:03o}",
+    ]
 
 
 def nine_su_file_exists(user: str, path: str, runner: Runner) -> bool:

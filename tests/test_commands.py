@@ -1,9 +1,11 @@
 """Tests for commands.py — command implementations."""
 
+import posixpath
+
 import pytest
 
 from conftest import hostile
-from shellparse import argv
+from shellparse import argv, script_argv
 from nine_manage_anubis.runner import CommandTimeout, FakeRunner
 from nine_manage_anubis.validate import ValidationError
 from nine_manage_anubis.commands import (
@@ -198,6 +200,43 @@ def test_enable_real_new_domain():
     assert result.success
     steps_text = " ".join(result.steps)
     assert "Switched" in steps_text or "proxy" in steps_text.lower()
+
+
+def test_every_file_an_enable_writes_brings_its_own_directory():
+    # On a host that has never run this tool, ~/.config/anubis does not exist,
+    # and the env file the systemd unit reads has to arrive with it. The failure
+    # this guards against needs no hostile input and no unusual host: it is the
+    # first install on any clean machine.
+    r = _base_runner()
+    cmd_enable("example.com", runner=r)
+
+    targets = []
+    for call in [c for c in r.calls if "cat > " in c]:
+        words = script_argv(call)
+        target = words[words.index(">") + 1]
+        assert words[:4] == ["mkdir", "-p", "--", posixpath.dirname(target)], (
+            f"nothing created the parent directory of {target}"
+        )
+        targets.append(target)
+
+    assert "/home/www-anubis/.config/anubis/example.com.env" in targets
+    assert "/home/www-anubis/.config/anubis/example.com.key" in targets
+
+
+def test_the_env_and_key_files_an_enable_writes_are_the_owners_alone():
+    # Asserted here as well as at the write helpers, because this is the path an
+    # operator actually runs: it is `enable` that decides which files an instance
+    # gets, and which of them carry a signing key.
+    r = _base_runner()
+    cmd_enable("example.com", runner=r)
+
+    for name in ("example.com.env", "example.com.key"):
+        write = [
+            c for c in r.calls
+            if f"cat > /home/www-anubis/.config/anubis/{name}" in c
+        ]
+        assert len(write) == 1, f"{name} was not written exactly once"
+        assert "umask 177" in write[0].splitlines()
 
 
 def test_enable_prepare_only():

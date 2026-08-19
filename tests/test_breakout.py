@@ -13,12 +13,10 @@ a shell does, so a shell answers it: the file must hold what we asked for, and
 the payload must not have run.
 """
 
-import os
-import stat
 from pathlib import Path
 
 import pytest
-from conftest import TERMINATORS
+from conftest import TERMINATORS, USER
 from shellrunner import ShellRunner
 
 from nine_manage_anubis import config
@@ -30,8 +28,6 @@ from nine_manage_anubis.systemd import (
     write_key_file,
     write_systemd_template,
 )
-
-USER = "www-example"
 
 
 def payload(tmp_path: Path, terminator: str) -> tuple[str, Path]:
@@ -113,7 +109,6 @@ def test_key_write_delivers_content_holding_a_terminator(tmp_path, terminator):
     write_key_file(USER, str(target), content, runner=r)
 
     assert target.read_text() == content
-    assert stat.S_IMODE(os.stat(target).st_mode) == 0o600
     assert_nothing_escaped(r, probe)
 
 
