@@ -75,6 +75,23 @@ def test_is_active_inactive():
     assert result == "inactive"
 
 
+def test_is_active_tolerates_nonzero_exit():
+    """`systemctl is-active` exits 3 for any non-active unit.
+
+    Without failure tolerance the Runner raises RuntimeError instead of
+    reporting the state, which breaks every health check.
+    """
+    r = FakeRunner()
+    is_active("www-anubis", "example.com", runner=r)
+    assert "is-active anubis@example.com.service || true" in r.calls[0]
+
+
+def test_is_active_failed():
+    r = FakeRunner()
+    r.responses[_SU + "\nexport XDG_RUNTIME_DIR"] = "failed\n"
+    assert is_active("www-anubis", "example.com", runner=r) == "failed"
+
+
 # --- Template operations ------------------------------------------------------
 
 

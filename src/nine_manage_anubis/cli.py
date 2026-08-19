@@ -146,6 +146,23 @@ def _resolve_domains(args: argparse.Namespace, runner) -> list[str]:
 
 
 def main(argv: Sequence[str] | None = None, runner=None) -> int:
+    """Entry point — turns unhandled failures into a one-line error.
+
+    Operators run this over SSH; a Python traceback tells them nothing they
+    can act on. The underlying exception message already carries the failing
+    command and its stderr.
+    """
+    try:
+        return _dispatch(argv, runner)
+    except KeyboardInterrupt:
+        print("Aborted.", file=sys.stderr)
+        return 130
+    except (RuntimeError, ValueError) as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+
+
+def _dispatch(argv: Sequence[str] | None = None, runner=None) -> int:
     settings = load_settings()
     parser = build_parser(settings)
     args = parser.parse_args(argv)

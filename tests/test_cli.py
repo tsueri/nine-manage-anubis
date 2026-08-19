@@ -373,6 +373,19 @@ def test_restart_real():
     assert "Restarted" in out
 
 
+def test_command_failure_prints_error_not_traceback():
+    """A failing external command must surface as a one-line error, not a
+    Python traceback dumped in the operator's face."""
+    class _Boom(FakeRunner):
+        def __call__(self, cmd):
+            raise RuntimeError("Command failed (exit 3): systemctl --user is-active")
+
+    rc, out, err = _run(["restart"], runner=_Boom())
+    assert rc == 1
+    assert "Traceback" not in err
+    assert "Command failed (exit 3)" in err
+
+
 def test_self_test():
     r = _runner()
     rc, out, err = _run(["self-test"], runner=r)

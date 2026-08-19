@@ -222,6 +222,19 @@ def test_get_service_state_not_found():
     assert state == "not-found"
 
 
+def test_get_service_state_tolerates_nonzero_exit():
+    """`systemctl is-active` exits 3 for any non-active unit — discovery
+    must still report the state instead of the Runner raising."""
+    r = FakeRunner()
+    _get_service_state("www-anubis", "example.ch", r)
+    assert "is-active anubis@example.ch.service || true" in r.calls[0]
+
+
+def test_get_service_state_failed():
+    r = FakeRunner({_su_key("export XDG_RUNTIME_DIR"): "failed\n"})
+    assert _get_service_state("www-anubis", "example.ch", r) == "failed"
+
+
 # --- Instance discovery tests -------------------------------------------------
 
 

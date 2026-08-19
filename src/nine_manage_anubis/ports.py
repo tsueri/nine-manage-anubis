@@ -175,9 +175,11 @@ def get_claimed_ports(runner: Runner = SubprocessRunner()) -> dict[int, tuple[st
 def _get_service_state(
     user: str, instance: str, runner: Runner
 ) -> str:
+    # `systemctl is-active` exits 3 for anything that isn't active — see
+    # systemd.is_active for why the `|| true` is load-bearing.
     result = nine_su_systemd(
         user,
-        f"systemctl --user is-active anubis@{instance}.service",
+        f"systemctl --user is-active anubis@{instance}.service || true",
         runner,
     )
     result = result.strip()

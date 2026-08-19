@@ -39,9 +39,12 @@ def restart_service(user: str, instance: str, runner: Runner = SubprocessRunner(
 
 
 def is_active(user: str, instance: str, runner: Runner = SubprocessRunner()) -> str:
+    # `systemctl is-active` exits 3 for anything that isn't active, but still
+    # prints the state on stdout. `|| true` keeps the Runner from treating a
+    # perfectly informative answer ("inactive", "failed") as a command failure.
     result = nine_su_systemd(
         user,
-        f"systemctl --user is-active anubis@{instance}.service",
+        f"systemctl --user is-active anubis@{instance}.service || true",
         runner,
     )
     return result.strip()
