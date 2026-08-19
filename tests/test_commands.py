@@ -62,6 +62,7 @@ def _base_runner(**overrides) -> FakeRunner:
         "test -d /home/www-anubis/.config/anubis && echo yes || echo no": "yes",
         _SU + "ls ~/.config/anubis/*.env 2>/dev/null": "/home/www-anubis/.config/anubis/test.example.ch.env\n",
         _SU + "cat -- /home/www-anubis/.config/anubis/test.example.ch.env": "BIND=:7010\nMETRICS_BIND=:7011\nTARGET_HOST=origin-test.example.ch\n",
+        _SU + "cat -- /home/www-anubis/.config/anubis/test.example.ch.key": "0123456789abcdef\n",
         _SU + "export XDG_RUNTIME_DIR": "active",
         _SU + "/home/www-anubis/bin/anubis --version": "Anubis version 1.27.0\n",
         _SU + "test -f": "yes\n",
@@ -317,6 +318,11 @@ def test_disable_not_last_vhost():
     steps_text = " ".join(result.steps)
     assert "still serving" in steps_text
     assert "blog.example.ch" in steps_text
+    # blog.example.ch is still proxying to this instance, so nothing about it may
+    # be touched — that is the whole difference between the two branches.
+    assert not any("systemctl --user disable --now" in c for c in r.calls)
+    assert not any("virtual-host remove" in c for c in r.calls)
+    assert not any("rm -f -- /home/www-anubis/.config/anubis/" in c for c in r.calls)
 
 
 # --- upgrade ------------------------------------------------------------------
@@ -1055,3 +1061,273 @@ def test_one_wording_for_a_probe_that_could_not_be_made():
     assert PROBE_FAILED in result.error
     assert PROBE_FAILED in " ".join(result.warnings)
     assert PROBE_FAILED in health_map["test.example.ch"]
+
+
+
+# --- disable is transactional -------------------------------------------------
+#
+# Teardown is several destructive steps in a row — the service, the origin
+# vhost, the webroot fixups, the instance's own files. A failure part-way used
+# to leave the site switched away from Anubis *and* the instance half removed,
+# which is neither state an operator can reason about. Every step therefore
+# carries its undo, and the failure of any one of them puts the rest back.
+
+# The protected site in VHOSTS_WITH_PROXY, and the artifacts of its instance.
+PROTECTED = "test.example.ch"
+PROTECTED_WEBROOT = f"/home/www-anubis/{PROTECTED}"
+INSTANCE_ENV = f"/home/www-anubis/.config/anubis/{PROTECTED}.env"
+INSTANCE_KEY = f"/home/www-anubis/.config/anubis/{PROTECTED}.key"
+
+# Each teardown step and each undo, named by the command it issues. Tests match
+# on the command rather than on the function that builds it: a refactor that
+# still does the same thing to the host still passes, and one that quietly
+# stops doing it does not.
+SWITCH_AWAY = "--template=default_letsencrypt_https"
+STOP_SERVICE = "systemctl --user disable --now"
+REMOVE_ORIGIN = f"virtual-host remove origin-{PROTECTED}"
+RESTORE_FIXUPS = f"rm -f -- {PROTECTED_WEBROOT}/.user.ini"
+REMOVE_ENV = f"rm -f -- {INSTANCE_ENV}"
+REMOVE_KEY = f"rm -f -- {INSTANCE_KEY}"
+
+SWITCH_BACK = "--template=proxy_letsencrypt_https_redirect"
+START_SERVICE = "systemctl --user enable --now"
+RECREATE_ORIGIN = f"virtual-host create origin-{PROTECTED}"
+REINSTALL_FIXUPS = f"cat > {PROTECTED_WEBROOT}/anubis-origin-shim.php"
+RESTORE_ENV = f"cat > {INSTANCE_ENV}"
+
+
+class _RunnerFailingAt(FakeRunner):
+    """Answers as usual until a command matches a needle, then refuses it once.
+
+    The failure is injected at the command, not at the Python function that
+    builds it, so a test says "the host refused to stop the service" rather
+    than "this call raised" — which is what an operator hits, and what stays
+    true across a refactor.
+    """
+
+    def __init__(self, *needles: str, **responses: str):
+        super().__init__(_base_runner(**responses).responses)
+        self._pending = list(needles)
+
+    def __call__(self, cmd, **kwargs):
+        for needle in self._pending:
+            if needle in cmd:
+                self._pending.remove(needle)
+                raise RuntimeError(f"the host refused: {needle}")
+        return super().__call__(cmd, **kwargs)
+
+
+def _issued(runner: FakeRunner, needle: str) -> bool:
+    return any(needle in c for c in runner.calls)
+
+
+# Each teardown step, and everything that must be back in place if it fails.
+# A step that is one command is either done or not, so its own undo is absent
+# from its row; the fixups are several commands and can fail half done, so
+# theirs is the one row that includes its own undo.
+TEARDOWN_STEPS = [
+    pytest.param(SWITCH_AWAY, [], id="switching the public vhost away"),
+    pytest.param(STOP_SERVICE, [SWITCH_BACK], id="stopping the service"),
+    pytest.param(
+        REMOVE_ORIGIN,
+        [START_SERVICE, SWITCH_BACK],
+        id="removing the origin vhost",
+    ),
+    pytest.param(
+        RESTORE_FIXUPS,
+        [REINSTALL_FIXUPS, RECREATE_ORIGIN, START_SERVICE, SWITCH_BACK],
+        id="restoring the webroot fixups",
+    ),
+    pytest.param(
+        REMOVE_ENV,
+        [REINSTALL_FIXUPS, RECREATE_ORIGIN, START_SERVICE, SWITCH_BACK],
+        id="removing the env file",
+    ),
+    pytest.param(
+        REMOVE_KEY,
+        [RESTORE_ENV, REINSTALL_FIXUPS, RECREATE_ORIGIN, START_SERVICE, SWITCH_BACK],
+        id="removing the key file",
+    ),
+]
+
+
+@pytest.mark.parametrize("failing_step,expected_undos", TEARDOWN_STEPS)
+def test_a_failed_teardown_step_puts_the_preceding_ones_back(
+    failing_step, expected_undos
+):
+    r = _RunnerFailingAt(failing_step)
+    result = cmd_disable(PROTECTED, runner=r)
+
+    assert not result.success
+    assert "Disable failed" in result.error
+    for undo in expected_undos:
+        assert _issued(r, undo), f"{undo} was never issued"
+
+
+@pytest.mark.parametrize("failing_step,expected_undos", TEARDOWN_STEPS)
+def test_a_failed_teardown_reports_which_steps_were_undone(
+    failing_step, expected_undos
+):
+    """A traceback says what broke; only the report says what state you are in."""
+    r = _RunnerFailingAt(failing_step)
+    result = cmd_disable(PROTECTED, runner=r)
+
+    rolled_back = [s for s in result.steps if s.startswith("Rolled back:")]
+    assert len(rolled_back) == len(expected_undos)
+    assert f"Rolled back {len(expected_undos)}" in result.error
+
+
+def test_a_failed_teardown_names_the_artifacts_it_put_back():
+    """"Rolled back 3 steps" is a count; an operator needs the nouns."""
+    r = _RunnerFailingAt(RESTORE_FIXUPS)
+    result = cmd_disable(PROTECTED, runner=r)
+
+    report = " ".join(s for s in result.steps if s.startswith("Rolled back:"))
+    assert f"origin-{PROTECTED}" in report
+    assert f"anubis@{PROTECTED}.service" in report
+    assert PROTECTED_WEBROOT in report
+    assert PROTECTED in report
+
+
+def test_a_rollback_step_that_fails_names_what_needs_manual_cleanup():
+    r = _RunnerFailingAt(REMOVE_ORIGIN, START_SERVICE)
+    result = cmd_disable(PROTECTED, runner=r)
+
+    assert not result.success
+    warning = " ".join(result.warnings)
+    assert f"anubis@{PROTECTED}.service" in warning
+    assert "manual" in warning.lower()
+
+
+def test_a_rollback_step_that_fails_does_not_abort_the_rest_of_the_rollback():
+    """The one thing worse than a half-torn-down instance is a half-restored one."""
+    r = _RunnerFailingAt(REMOVE_ORIGIN, START_SERVICE)
+    cmd_disable(PROTECTED, runner=r)
+
+    assert _issued(r, SWITCH_BACK), "the public vhost was left off Anubis"
+
+
+def test_the_origin_vhost_comes_back_with_the_php_version_it_had():
+    """Recreating it without PHP_VERSION serves the site's PHP as plain text."""
+    r = _RunnerFailingAt(RESTORE_FIXUPS)
+    cmd_disable(PROTECTED, runner=r)
+
+    recreate = [c for c in r.calls if RECREATE_ORIGIN in c]
+    assert len(recreate) == 1
+    assert "--template-variable=PHP_VERSION=8.2" in recreate[0]
+
+
+def test_the_env_file_comes_back_with_the_content_it_had():
+    """A restored env file naming the wrong port is worse than no env file."""
+    r = _RunnerFailingAt(REMOVE_KEY)
+    cmd_disable(PROTECTED, runner=r)
+
+    rewrite = [c for c in r.calls if RESTORE_ENV in c]
+    assert len(rewrite) == 1
+    assert "BIND=:7010" in rewrite[0]
+    assert "TARGET_HOST=origin-test.example.ch" in rewrite[0]
+
+
+def test_the_env_file_comes_back_at_the_mode_it_had():
+    """It names the key's path and the instance's ports — nobody else's business."""
+    r = _RunnerFailingAt(REMOVE_KEY)
+    cmd_disable(PROTECTED, runner=r)
+
+    rewrite = [c for c in r.calls if RESTORE_ENV in c]
+    assert "umask 177" in rewrite[0].splitlines()
+
+
+def test_a_webroot_with_no_fixups_does_not_gain_any_from_a_rollback():
+    """`restore` is a no-op there, so its undo must be one too.
+
+    A shared webroot whose sibling is not behind Anubis is the case: installing
+    a shim and an .htaccess block that were never there is not putting the host
+    back as we found it, it is changing somebody else's site.
+    """
+    r = _RunnerFailingAt(REMOVE_ENV, **{
+        # Nothing in the webroot: no .user.ini, no .htaccess, no shim, no chain.
+        # (The env and key reads keep their own, more specific, answers.)
+        _SU + "test -f": "no\n",
+        _SU + "cat --": "__NINE_SU_FILE_NOT_FOUND__",
+    })
+    result = cmd_disable(PROTECTED, runner=r)
+
+    assert not result.success
+    assert not _issued(r, REINSTALL_FIXUPS), "a rollback installed fixups"
+    assert any("No fixup files to restore" in s for s in result.steps)
+
+
+def test_a_disable_that_completes_reports_no_rollback():
+    r = _base_runner()
+    result = cmd_disable(PROTECTED, runner=r)
+
+    assert result.success
+    assert not any(s.startswith("Rolled back") for s in result.steps)
+
+
+# --- disable refcounts against a fresh listing --------------------------------
+#
+# Whether this is the last vhost on the port used to be decided from a listing
+# taken before the public vhost was switched away, and never re-checked. A
+# concurrent enable landing in that window made disable tear down an instance
+# other live vhosts were still proxying to.
+
+# What the vhost list says once a concurrent `enable` has put a second site on
+# port 7010 and our own switch has landed.
+VHOSTS_AFTER_A_CONCURRENT_ENABLE = """[
+  {"domain": "test.example.ch", "user": "www-anubis", "webroot": "/home/www-anubis/test.example.ch", "template": "default_letsencrypt_https", "template_variables": {}, "aliases": [], "jobs": []},
+  {"domain": "blog.example.ch", "user": "www-anubis", "webroot": "/home/www-anubis/test.example.ch", "template": "proxy_letsencrypt_https_redirect", "template_variables": {"PROXYPORT": "7010"}, "aliases": [], "jobs": []},
+  {"domain": "origin-test.example.ch", "user": "www-anubis", "webroot": "/home/www-anubis/test.example.ch", "template": "default_snakeoil_https", "template_variables": {"PHP_VERSION": "8.2"}, "aliases": [], "jobs": []}
+]"""
+
+_VHOST_LIST = "sudo nine-manage-vhosts virtual-host list --json"
+
+
+class _RunnerGainingAVhostDuringTheSwitch(FakeRunner):
+    """A host on which another vhost joins the port while disable is running.
+
+    The canned listing is rewritten the moment the public vhost is switched
+    away — a concurrent `enable` landing in exactly the window the teardown
+    decision used to be made before.
+    """
+
+    def __init__(self):
+        super().__init__(_base_runner().responses)
+
+    def __call__(self, cmd, **kwargs):
+        if SWITCH_AWAY in cmd:
+            self.responses[_VHOST_LIST] = VHOSTS_AFTER_A_CONCURRENT_ENABLE
+        return super().__call__(cmd, **kwargs)
+
+
+def _teardown_was_attempted(runner: FakeRunner) -> bool:
+    return any(
+        _issued(runner, needle)
+        for needle in (STOP_SERVICE, REMOVE_ORIGIN, RESTORE_FIXUPS, REMOVE_ENV)
+    )
+
+
+def test_a_vhost_that_joins_the_port_during_the_switch_saves_the_instance():
+    r = _RunnerGainingAVhostDuringTheSwitch()
+    result = cmd_disable(PROTECTED, runner=r)
+
+    assert result.success
+    assert not _teardown_was_attempted(r), "an instance other sites use was torn down"
+
+
+def test_a_vhost_that_joins_the_port_during_the_switch_is_named_in_the_report():
+    r = _RunnerGainingAVhostDuringTheSwitch()
+    result = cmd_disable(PROTECTED, runner=r)
+
+    report = " ".join(result.steps)
+    assert "blog.example.ch" in report
+    assert "left running" in report
+
+
+def test_the_vhost_asked_about_is_still_switched_off_anubis():
+    """Sparing the instance is not the same as refusing the operator's request."""
+    r = _RunnerGainingAVhostDuringTheSwitch()
+    result = cmd_disable(PROTECTED, runner=r)
+
+    assert _issued(r, SWITCH_AWAY)
+    assert any("Switched" in s for s in result.steps)

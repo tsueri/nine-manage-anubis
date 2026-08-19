@@ -170,7 +170,7 @@ nine-manage-anubis --dry-run enable example.com
 
 ### `disable`
 
-Remove Anubis protection from a vhost. Switches the public vhost back to `default_letsencrypt_https`. If this was the last vhost on the instance's port, tears down the instance (stop service, remove origin vhost, restore fixup files, remove env + key). If other vhosts still share the instance, it stays running.
+Remove Anubis protection from a vhost. Switches the public vhost back to `default_letsencrypt_https`, then re-reads which vhosts are still on the instance's port. If this was the last one, tears down the instance (stop service, remove origin vhost, restore fixup files, remove env + key); if other vhosts still share it, the instance stays running and nothing else is touched. A teardown that fails part-way is rolled back — see [Architecture](#architecture).
 
 ```
 nine-manage-anubis disable <domain> [domain ...]
@@ -464,7 +464,9 @@ Anubis sits between two Apache vhosts. The public vhost proxies to Anubis; Anubi
 
 **Instance files**: an instance's env file and signing key are created 0600, in a `~/.config/anubis` the CLI creates if it isn't there. The mode is decided before the content is written rather than chmodded afterwards, so the key is never on disk readable by another user, not even for the length of a write. A file already sitting at either path is replaced; one that can't be replaced — owned by another user, say — fails the write instead of being written into. Webroot files (`.htaccess`, `.user.ini`, the PHP shim) keep the permissions their owner gave them.
 
-**Rollback**: if `enable` fails after making changes, the CLI undoes every step in reverse order (switch vhost back, remove origin vhost, restore fixup files, remove env/key, disable service).
+**Rollback**: `enable` and `disable` both either complete or put the host back as they found it. Each step carries its undo, and a failure runs the undos in reverse order — `enable` unwinds what it created (switch vhost back, remove origin vhost, restore fixup files, remove env/key, disable service), `disable` puts back what it removed (rewrite env/key, reinstall fixups, recreate the origin vhost with its PHP version, restart the service, switch the vhost back to Anubis). The report names each artifact that went back; an undo that itself fails becomes a warning naming what needs manual cleanup, and does not stop the remaining undos.
+
+**Refcounting**: several vhosts sharing a webroot share one Anubis instance, so `disable` only tears one down when nothing else is using it. That decision is re-read from a fresh vhost listing immediately before the first destructive step, after the public vhost has already been switched away — a listing taken any earlier still counts the vhost being disabled and predates any concurrent `enable`, and acting on it takes the other sites down. The window is narrowed rather than closed: a sibling becomes visible when its public vhost reaches the port, so an `enable` that has claimed the instance but not yet cut over is still missed.
 
 **Failures and timeouts**: a failing external command is reported as the program, its exit code and its stderr — never as the command string, which can carry a freshly generated signing key. Every command runs under a timeout (60s by default; longer for a binary download, a certificate request or a service change), and overrunning it produces a `timed out after Ns` error naming the operation instead of a run that hangs with no output.
 

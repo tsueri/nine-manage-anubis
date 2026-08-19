@@ -21,6 +21,7 @@ from .nine_su import (
     mkdir_parent,
     nine_su,
     nine_su_file_exists,
+    nine_su_read_file,
     nine_su_systemd,
     nine_su_unlink,
     nine_su_write_file,
@@ -127,6 +128,15 @@ def write_env_file(user: str, path: str, content: str, runner: Runner = Subproce
 
 def write_key_file(user: str, path: str, key_content: str, runner: Runner = SubprocessRunner()) -> None:
     nine_su_write_file(user, path, key_content, runner, owner_only=True)
+
+
+def read_file(user: str, path: str, runner: Runner = SubprocessRunner()) -> str | None:
+    """The content of one of an instance's files, or None if it is not there.
+
+    For the caller that has to be able to put a file back: a removal it cannot
+    undo is a removal that cannot be part of a transaction.
+    """
+    return nine_su_read_file(user, path, runner)
 
 
 def remove_file(user: str, path: str, runner: Runner = SubprocessRunner()) -> None:

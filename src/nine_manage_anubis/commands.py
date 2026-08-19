@@ -7,6 +7,7 @@ Each takes an injectable Runner and returns a list of step strings
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from .runner import CommandFailed, CommandTimeout, Runner, SubprocessRunner
@@ -27,6 +28,7 @@ from .vhosts import (
     user_exists,
     certificate_exists,
     create_certificate,
+    DEFAULT_LE_TEMPLATE,
     PROXY_TEMPLATE,
 )
 from .config import (
@@ -47,6 +49,7 @@ from .systemd import (
     remove_systemd_template,
     write_env_file,
     write_key_file,
+    read_file,
     remove_file,
     binary_exists,
     binary_version,
@@ -55,7 +58,11 @@ from .systemd import (
     get_latest_version,
     extract_policy,
 )
-from .fixups import apply as apply_fixups, restore as restore_fixups
+from .fixups import (
+    apply as apply_fixups,
+    restore as restore_fixups,
+    restore_plan,
+)
 from .settings import Settings
 from .fileops import RemoteFileOps
 from .shell import quote
@@ -380,22 +387,89 @@ def cmd_uninstall(
 # --- enable -------------------------------------------------------------------
 
 
-def _rollback(undo_stack: list, result: CommandResult) -> None:
-    """Execute undo actions in reverse order. Best-effort."""
+# The six artifacts an enable creates and a disable removes, named here and
+# nowhere else. Three commands talk about them — enable's report, disable's
+# report, and the rollback shared by both — and an operator comparing the
+# three is looking at one instance, so they may not drift into three
+# vocabularies for the same six things.
+
+
+def _public_vhost(domain: str) -> str:
+    return f"the public vhost {domain}"
+
+
+def _service(domain: str) -> str:
+    return f"anubis@{domain}.service"
+
+
+def _origin_vhost(domain: str) -> str:
+    return f"origin vhost origin-{domain}"
+
+
+def _webroot_fixups(webroot: str) -> str:
+    return f"the webroot fixups in {webroot}"
+
+
+def _env_file(path: str) -> str:
+    return f"the env file {path}"
+
+
+def _key_file(path: str) -> str:
+    return f"the key file {path}"
+
+
+@dataclass
+class UndoStep:
+    """How to put one artifact back, and what to call it while doing so.
+
+    ``artifact`` names the thing rather than the action — "anubis@x.service",
+    not "restarted anubis@x.service" — for two reasons. One phrase then reads
+    correctly both in the step that reports the undo working and in the
+    warning that reports it failing, which is where an operator is least in
+    the mood for a grammar puzzle. And `enable` and `disable` undo the same
+    six artifacts in opposite directions, so naming the artifact makes the two
+    commands describe one instance with one vocabulary.
+    """
+
+    artifact: str
+    undo: Callable[[], object]
+
+
+def _rollback(undo_stack: list[UndoStep], result: CommandResult) -> int:
+    """Put every artifact back, most recent first. Returns how many went back.
+
+    Best-effort by design: an undo that fails is reported and the rest still
+    run. Stopping at the first failure would strand the artifacts below it —
+    and the one at the bottom of the stack is the public vhost, i.e. whether
+    the site is being served at all.
+    """
     undone = 0
-    for undo in reversed(undo_stack):
+    for step in reversed(undo_stack):
         try:
-            undo()
-            undone += 1
-        except Exception:
-            result.warnings.append("A rollback step failed — manual cleanup may be needed")
-    result.steps.append(f"Rolled back {undone} of {len(undo_stack)} step(s)")
+            step.undo()
+        except Exception as e:
+            result.warnings.append(
+                f"Could not roll back {step.artifact} — manual cleanup needed: {e}"
+            )
+            continue
+        result.steps.append(f"Rolled back: {step.artifact}")
+        undone += 1
+    return undone
 
 
-def _fail_with_rollback(undo_stack: list, result: CommandResult, exc: Exception) -> None:
-    """Roll back and set error message."""
-    _rollback(undo_stack, result)
-    result.error = f"Enable failed: {exc}. Rolled back {len(undo_stack)} step(s)."
+def _fail_with_rollback(
+    undo_stack: list[UndoStep],
+    result: CommandResult,
+    exc: Exception,
+    *,
+    action: str,
+) -> None:
+    """Put back what this command changed, and say what happened and what went back."""
+    undone = _rollback(undo_stack, result)
+    result.error = (
+        f"{action} failed: {exc}. Rolled back {undone} of "
+        f"{len(undo_stack)} step(s)."
+    )
 
 
 def cmd_enable(
@@ -453,16 +527,19 @@ def cmd_enable(
             )
 
         if not prepare_only:
-            undo_stack: list = []
+            undo_stack: list[UndoStep] = []
             try:
                 if not certificate_exists(domain, runner=runner):
                     create_certificate(domain, runner=runner)
                     result.steps.append(f"Created Let's Encrypt certificate for {domain}")
                 switch_to_proxy(domain, alloc.app_port, no_notify=no_notify, runner=runner)
-                undo_stack.append(lambda: switch_to_default(domain, no_notify=no_notify, runner=runner))
+                undo_stack.append(UndoStep(
+                    _public_vhost(domain),
+                    lambda: switch_to_default(domain, no_notify=no_notify, runner=runner),
+                ))
                 result.steps.append(f"Switched {domain} to proxy template (PROXYPORT={alloc.app_port})")
             except Exception as e:
-                _fail_with_rollback(undo_stack, result, e)
+                _fail_with_rollback(undo_stack, result, e, action="Enable")
                 return result
         return result
 
@@ -474,7 +551,7 @@ def cmd_enable(
         key_path=key_path_for(anubis_user, domain),
     )
 
-    undo_stack: list = []
+    undo_stack: list[UndoStep] = []
     ops = RemoteFileOps(website_user, runner)
 
     if not cutover_only:
@@ -504,10 +581,16 @@ def cmd_enable(
         if not dry_run:
             try:
                 write_key_file(anubis_user, config.key_path, key_content, runner=runner)
-                undo_stack.append(lambda: remove_file(anubis_user, config.key_path, runner=runner))
+                undo_stack.append(UndoStep(
+                    _key_file(config.key_path),
+                    lambda: remove_file(anubis_user, config.key_path, runner=runner),
+                ))
 
                 write_env_file(anubis_user, config.env_path, env_content, runner=runner)
-                undo_stack.append(lambda: remove_file(anubis_user, config.env_path, runner=runner))
+                undo_stack.append(UndoStep(
+                    _env_file(config.env_path),
+                    lambda: remove_file(anubis_user, config.env_path, runner=runner),
+                ))
 
                 if not template_exists(anubis_user, runner=runner):
                     write_systemd_template(anubis_user, SYSTEMD_TEMPLATE, runner=runner)
@@ -515,15 +598,24 @@ def cmd_enable(
                 daemon_reload(anubis_user, runner=runner)
 
                 apply_fixups(webroot, ops, dry_run=False)
-                undo_stack.append(lambda: restore_fixups(webroot, ops, dry_run=False))
+                undo_stack.append(UndoStep(
+                    _webroot_fixups(webroot),
+                    lambda: restore_fixups(webroot, ops, dry_run=False),
+                ))
 
                 create_origin_vhost(domain, website_user, webroot, php_version, no_notify=no_notify, runner=runner)
-                undo_stack.append(lambda: remove_origin_vhost(domain, no_notify=no_notify, runner=runner))
+                undo_stack.append(UndoStep(
+                    _origin_vhost(domain),
+                    lambda: remove_origin_vhost(domain, no_notify=no_notify, runner=runner),
+                ))
 
                 enable_service(anubis_user, domain, runner=runner)
-                undo_stack.append(lambda: disable_service(anubis_user, domain, runner=runner))
+                undo_stack.append(UndoStep(
+                    _service(domain),
+                    lambda: disable_service(anubis_user, domain, runner=runner),
+                ))
             except Exception as e:
-                _fail_with_rollback(undo_stack, result, e)
+                _fail_with_rollback(undo_stack, result, e, action="Enable")
                 return result
 
     if not prepare_only:
@@ -535,10 +627,13 @@ def cmd_enable(
                     create_certificate(domain, runner=runner)
                     result.steps.append(f"Created Let's Encrypt certificate for {domain}")
                 switch_to_proxy(domain, alloc.app_port, no_notify=no_notify, runner=runner)
-                undo_stack.append(lambda: switch_to_default(domain, no_notify=no_notify, runner=runner))
+                undo_stack.append(UndoStep(
+                    _public_vhost(domain),
+                    lambda: switch_to_default(domain, no_notify=no_notify, runner=runner),
+                ))
                 result.steps.append(f"Cut over {domain} to proxy template (PROXYPORT={alloc.app_port})")
             except Exception as e:
-                _fail_with_rollback(undo_stack, result, e)
+                _fail_with_rollback(undo_stack, result, e, action="Enable")
                 return result
 
     return result
@@ -590,50 +685,225 @@ def cmd_disable(
         result.error = f"Cannot determine PROXYPORT for {domain}"
         return result
 
-    vhosts_for_port = find_vhosts_for_port(port, runner=runner)
-    is_last = len(vhosts_for_port) <= 1
-
     if dry_run:
-        result.steps.append(f"Switch {domain} back to default_letsencrypt_https")
-        if is_last:
-            result.steps.append(f"This is the last vhost on port {port} — would tear down instance:")
-            result.steps.append(f"  Stop + disable anubis@{domain}.service")
-            result.steps.append(f"  Remove origin vhost origin-{domain}")
-            result.steps.append(f"  Restore fixup files")
-            result.steps.append(f"  Remove env file + key")
-        else:
-            result.steps.append(
-                f"Other vhosts still on port {port}: {', '.join(v for v in vhosts_for_port if v != domain)} — "
-                f"instance stays running"
-            )
+        _describe_disable(domain, port, runner, result)
         return result
 
-    switch_to_default(domain, no_notify=no_notify, runner=runner)
-    result.steps.append(f"Switched {domain} back to default_letsencrypt_https")
+    # Read before breaking: the origin vhost is the one artifact whose shape
+    # this tool does not know from the domain alone — its PHP version came
+    # from the public vhost back when that still had one — so its record is
+    # taken while it is still there, and is what recreates it if the teardown
+    # has to be undone.
+    origin = get_vhost(f"origin-{domain}", runner=runner)
 
-    if is_last:
-        disable_service(anubis_user, domain, runner=runner)
-        result.steps.append(f"Stopped + disabled anubis@{domain}.service")
+    undo_stack: list[UndoStep] = []
+    try:
+        switch_to_default(domain, no_notify=no_notify, runner=runner)
+        undo_stack.append(UndoStep(
+            _public_vhost(domain),
+            lambda: switch_to_proxy(domain, port, no_notify=no_notify, runner=runner),
+        ))
+        result.steps.append(f"Switched {domain} back to {DEFAULT_LE_TEMPLATE}")
 
-        remove_origin_vhost(domain, no_notify=no_notify, runner=runner)
-        result.steps.append(f"Removed origin vhost origin-{domain}")
+        # The refcount is read *here*, after the switch and immediately before
+        # the first destructive step, and never from a listing taken earlier.
+        # A listing from before the switch still counts this vhost, and — worse
+        # — predates any concurrent enable, so acting on it can tear down an
+        # instance other live vhosts are proxying to.
+        #
+        # Narrowed, not closed: this sees a sibling once its public vhost is on
+        # the port, so an enable that has claimed the instance but not yet cut
+        # its vhost over is still invisible. Shutting that window needs a lock
+        # around the whole allocate-and-cut-over, which is its own problem.
+        others = _other_vhosts_on_port(domain, port, runner)
+        if others:
+            result.steps.append(
+                f"Instance still serving: {', '.join(others)} — left running"
+            )
+            return result
 
-        ops = RemoteFileOps(website_user, runner)
-        restore_fixups(webroot, ops, dry_run=False)
-        result.steps.append("Restored fixup files")
-
-        env_path = env_path_for(anubis_user, domain)
-        key_path = key_path_for(anubis_user, domain)
-        remove_file(anubis_user, env_path, runner=runner)
-        remove_file(anubis_user, key_path, runner=runner)
-        result.steps.append("Removed env file + key")
-    else:
-        others = [v for v in vhosts_for_port if v != domain]
-        result.steps.append(
-            f"Instance still serving: {', '.join(others)} — left running"
+        _tear_down_instance(
+            domain=domain,
+            anubis_user=anubis_user,
+            website_user=website_user,
+            webroot=webroot,
+            origin=origin,
+            no_notify=no_notify,
+            runner=runner,
+            undo_stack=undo_stack,
+            result=result,
         )
+    except Exception as e:
+        _fail_with_rollback(undo_stack, result, e, action="Disable")
 
     return result
+
+
+def _other_vhosts_on_port(domain: str, port: int, runner: Runner) -> list[str]:
+    """The vhosts still proxying to this port, other than ``domain`` itself."""
+    return [v for v in find_vhosts_for_port(port, runner=runner) if v != domain]
+
+
+def _describe_disable(
+    domain: str, port: int, runner: Runner, result: CommandResult
+) -> None:
+    """What a disable would do, from the listing as it stands now.
+
+    A dry run cannot promise the teardown verdict, because the real run
+    re-reads the refcount after switching the vhost away and may find a
+    sibling that appeared in between. It describes the host as it is.
+    """
+    result.steps.append(f"Switch {domain} back to {DEFAULT_LE_TEMPLATE}")
+    others = _other_vhosts_on_port(domain, port, runner)
+    if others:
+        result.steps.append(
+            f"Other vhosts still on port {port}: {', '.join(others)} — "
+            f"instance stays running"
+        )
+        return
+    result.steps.append(f"This is the last vhost on port {port} — would tear down instance:")
+    result.steps.append(f"  Stop + disable {_service(domain)}")
+    result.steps.append(f"  Remove {_origin_vhost(domain)}")
+    result.steps.append(f"  Restore fixup files")
+    result.steps.append(f"  Remove env file + key")
+
+
+def _tear_down_instance(
+    *,
+    domain: str,
+    anubis_user: str,
+    website_user: str,
+    webroot: str,
+    origin: dict | None,
+    no_notify: bool,
+    runner: Runner,
+    undo_stack: list[UndoStep],
+    result: CommandResult,
+) -> None:
+    """Remove the instance nothing proxies to any more, undoably.
+
+    Each step registers its undo around the moment it runs, so whichever step
+    raises, the caller's rollback finds exactly the artifacts that changed. The
+    order is the reverse of the one `enable` builds them in, which is what
+    makes rolling back a partial teardown put a working instance back rather
+    than a differently broken one.
+
+    A step that is one command registers its undo *after* the command returns:
+    it either happened or it did not. A step that is several — the fixups — has
+    to register *before*, because a command in the middle of it can leave the
+    webroot changed and unfinished, and that is the state most in need of
+    undoing.
+    """
+    disable_service(anubis_user, domain, runner=runner)
+    undo_stack.append(UndoStep(
+        _service(domain),
+        lambda: enable_service(anubis_user, domain, runner=runner),
+    ))
+    result.steps.append(f"Stopped + disabled {_service(domain)}")
+
+    if origin is None:
+        # Already gone — an operator cleaned up by hand, or an earlier disable
+        # died here. Removing it again would fail and roll back a teardown that
+        # has nothing left to do.
+        result.warnings.append(
+            f"{_origin_vhost(domain)} was already gone — nothing to remove"
+        )
+    else:
+        remove_origin_vhost(domain, no_notify=no_notify, runner=runner)
+        undo_stack.append(UndoStep(
+            _origin_vhost(domain),
+            lambda: create_origin_vhost(
+                domain,
+                # Every field here was whitelisted by validate_vhost_record
+                # when the listing was parsed, so the fallback is about a field
+                # nine-manage-vhosts did not report — for which the public
+                # vhost's own values are the right answer, being where `enable`
+                # took the origin vhost's from in the first place.
+                origin.get("user") or website_user,
+                origin.get("webroot") or webroot,
+                (origin.get("template_variables") or {}).get("PHP_VERSION"),
+                no_notify=no_notify,
+                runner=runner,
+            ),
+        ))
+        result.steps.append(f"Removed {_origin_vhost(domain)}")
+
+    _restore_fixups_undoably(webroot, website_user, runner, undo_stack, result)
+
+    _remove_restorably(
+        anubis_user, env_path_for(anubis_user, domain), _env_file,
+        write_env_file, runner, undo_stack,
+    )
+    # The key goes last, mirroring `enable`, which writes it first. Its undo is
+    # registered even though no step follows it that could call for one: a
+    # teardown whose correctness depends on which step happens to be last is
+    # one that breaks silently the day a step is added.
+    _remove_restorably(
+        anubis_user, key_path_for(anubis_user, domain), _key_file,
+        write_key_file, runner, undo_stack,
+    )
+    result.steps.append("Removed env file + key")
+
+
+def _restore_fixups_undoably(
+    webroot: str,
+    website_user: str,
+    runner: Runner,
+    undo_stack: list[UndoStep],
+    result: CommandResult,
+) -> None:
+    """Take the Anubis fixups back out of the webroot, keeping the way back in.
+
+    Two things make this step unlike the others. It is several file operations,
+    so it can fail with the webroot half restored — hence the undo goes on the
+    stack before it runs, and `apply` is state-driven, so re-applying repairs a
+    half-restored webroot as readily as a fully restored one. And it is the one
+    step that may have nothing to do: on a webroot that never had fixups
+    `restore` is a no-op, and an undo registered anyway would *install* a shim
+    and an `.htaccess` block that were never there — the opposite of putting
+    the host back as we found it.
+
+    Putting them back is an inverse in effect, not byte for byte: `apply`
+    rewrites the fixups from the templates and takes its own backups, rather
+    than reversing the individual writes `restore` made.
+    """
+    ops = RemoteFileOps(website_user, runner)
+    if not restore_plan(webroot, ops).steps:
+        result.steps.append("No fixup files to restore")
+        return
+    undo_stack.append(UndoStep(
+        _webroot_fixups(webroot),
+        lambda: apply_fixups(webroot, ops, dry_run=False),
+    ))
+    restore_fixups(webroot, ops, dry_run=False)
+    result.steps.append("Restored fixup files")
+
+
+def _remove_restorably(
+    anubis_user: str,
+    path: str,
+    name: Callable[[str], str],
+    write: Callable[..., None],
+    runner: Runner,
+    undo_stack: list[UndoStep],
+) -> None:
+    """Delete one of the instance's own files, keeping the means to put it back.
+
+    The content is read first because a delete is otherwise the one step in a
+    teardown that cannot be undone — and a step after it can still fail. It
+    goes back through the same writer `enable` used, so a restored file lands
+    with the owner-only mode it had rather than with whatever a plain write
+    would leave.
+    """
+    content = read_file(anubis_user, path, runner=runner)
+    remove_file(anubis_user, path, runner=runner)
+    if content is None:
+        # Nothing was there, so nothing to put back.
+        return
+    undo_stack.append(UndoStep(
+        name(path),
+        lambda: write(anubis_user, path, content, runner=runner),
+    ))
 
 
 # --- upgrade ------------------------------------------------------------------
