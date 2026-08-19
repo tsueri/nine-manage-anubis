@@ -3,7 +3,7 @@
 import posixpath
 
 import pytest
-from conftest import HOSTILE_PATHS
+from conftest import HOSTILE_PATHS, TERMINATORS
 from shellparse import script_argv, sh_words_after, su_argv, su_script
 
 from nine_manage_anubis.runner import FakeRunner
@@ -33,7 +33,9 @@ _SU = "sudo nine-su www-anubis <<'NINE_SU_EOF'"
 
 
 def _su_calls(r: FakeRunner) -> list[str]:
-    return [c for c in r.calls if c.startswith(_SU)]
+    # The delimiter carries a per-invocation nonce, so match the part of the
+    # command that does not: the nine-su call itself.
+    return [c for c in r.calls if c.startswith("sudo nine-su www-anubis <<")]
 
 
 # --- Service operations -------------------------------------------------------
@@ -258,6 +260,16 @@ def test_write_env_file_quotes_the_path(path):
     assert "BIND=:7010" in su_script(r.calls[0])
 
 
+@pytest.mark.parametrize("terminator", TERMINATORS)
+def test_write_env_file_content_cannot_terminate_its_heredoc(terminator):
+    r = FakeRunner()
+    write_env_file(
+        "www-anubis", "/home/www-anubis/e.env", f"BIND=:7010\n{terminator}\nid", runner=r
+    )
+    assert f"{terminator}\nid" in su_script(r.calls[0])
+    assert "id" not in script_argv(r.calls[0])
+
+
 @pytest.mark.parametrize("path", HOSTILE_PATHS)
 def test_write_key_file_quotes_the_path(path):
     r = FakeRunner()
@@ -276,10 +288,13 @@ def test_write_key_file_restricts_the_mode_in_one_round_trip():
     assert ["chmod", "600", "--", "/home/www-anubis/k"] == script_argv(r.calls[0])[-4:]
 
 
-def test_write_key_file_content_cannot_terminate_its_heredoc():
+@pytest.mark.parametrize("terminator", TERMINATORS)
+def test_write_key_file_content_cannot_terminate_its_heredoc(terminator):
     r = FakeRunner()
-    write_key_file("www-anubis", "/home/www-anubis/k", "FILE_EOF\nid", runner=r)
-    assert "FILE_EOF\nid" in su_script(r.calls[0])
+    write_key_file(
+        "www-anubis", "/home/www-anubis/k", f"{terminator}\nid", runner=r
+    )
+    assert f"{terminator}\nid" in su_script(r.calls[0])
     assert "id" not in script_argv(r.calls[0])
 
 
@@ -315,10 +330,11 @@ def test_write_systemd_template_quotes_the_user_derived_path():
     assert path in script_argv(r.calls[0])
 
 
-def test_systemd_template_content_cannot_terminate_its_heredoc():
+@pytest.mark.parametrize("terminator", TERMINATORS)
+def test_systemd_template_content_cannot_terminate_its_heredoc(terminator):
     r = FakeRunner()
-    write_systemd_template("www-anubis", "[Unit]\nFILE_EOF\nid", runner=r)
-    assert "FILE_EOF\nid" in su_script(r.calls[0])
+    write_systemd_template("www-anubis", f"[Unit]\n{terminator}\nid", runner=r)
+    assert f"{terminator}\nid" in su_script(r.calls[0])
     assert "id" not in script_argv(r.calls[0])
 
 

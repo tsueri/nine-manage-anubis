@@ -16,6 +16,8 @@ from __future__ import annotations
 import subprocess
 from typing import Callable
 
+from .shell import strip_delimiter_nonces
+
 Runner = Callable[[str], str]
 
 
@@ -35,7 +37,14 @@ class SubprocessRunner:
 
 
 class FakeRunner:
-    """Test runner — returns canned stdout for given commands."""
+    """Test runner — returns canned stdout for given commands.
+
+    A response is keyed by the start of the command, matched against it with
+    heredoc delimiter nonces folded back to their bare prefix: a delimiter is
+    fresh on every invocation (see :func:`~nine_manage_anubis.shell.fresh_delimiter`),
+    so a key could not otherwise name a nine-su command at all. ``calls``
+    keeps each command as the shell would have seen it, nonce included.
+    """
 
     def __init__(self, responses: dict[str, str] | None = None):
         self.responses: dict[str, str] = responses or {}
@@ -43,9 +52,10 @@ class FakeRunner:
 
     def __call__(self, cmd: str) -> str:
         self.calls.append(cmd)
-        if cmd in self.responses:
-            return self.responses[cmd]
+        stable = strip_delimiter_nonces(cmd)
+        if stable in self.responses:
+            return self.responses[stable]
         for key, val in self.responses.items():
-            if cmd.startswith(key):
+            if stable.startswith(key):
                 return val
         return ""

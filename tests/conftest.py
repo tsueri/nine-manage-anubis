@@ -45,3 +45,10 @@ HOSTILE_PATHS = [
     "/home/www-example/$HOME",
     "/home/www-example/*",
 ]
+
+
+# The heredoc delimiters this tool once hard-coded. Content holding one of them
+# on a line ended the heredoc early and had the rest of itself run as commands,
+# so they are the payload every write is checked against — one list, for the
+# same reason as the one above.
+TERMINATORS = ["FILE_EOF", "KEY_EOF", "NINE_SU_EOF"]

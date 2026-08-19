@@ -9,7 +9,7 @@ via :func:`su_argv`, the far side via :func:`script_argv`.
 import posixpath
 
 import pytest
-from conftest import HOSTILE_PATHS
+from conftest import HOSTILE_PATHS, TERMINATORS
 from shellparse import script_argv, sh_words, sh_words_after, su_argv, su_script
 
 from nine_manage_anubis.nine_su import (
@@ -23,6 +23,8 @@ from nine_manage_anubis.nine_su import (
     nine_su_write_file,
 )
 from nine_manage_anubis.runner import FakeRunner
+from nine_manage_anubis import shell
+from nine_manage_anubis.shell import HeredocCollision
 
 
 def test_nine_su_runs_the_script_under_the_user():
@@ -87,13 +89,30 @@ def test_write_file_delivers_the_content_verbatim():
     assert "a 'b' `c`\n$(d)" in su_script(r.calls[0])
 
 
-def test_write_file_content_cannot_terminate_its_heredoc():
+@pytest.mark.parametrize("terminator", TERMINATORS)
+def test_write_file_content_cannot_terminate_its_heredoc(terminator):
     # Webroot files are attacker-controlled: restoring one whose content holds
     # a line equal to the delimiter would run the rest as the website user.
+    # These three are the delimiters this tool used to hard-code, so they are
+    # the lines a site owner would have written to break out.
     r = FakeRunner()
-    nine_su_write_file("www-example", "/home/www-example/.user.ini", "FILE_EOF\nid", r)
-    assert "FILE_EOF\nid" in su_script(r.calls[0])
+    nine_su_write_file(
+        "www-example", "/home/www-example/.user.ini", f"{terminator}\nid", r
+    )
+    assert f"{terminator}\nid" in su_script(r.calls[0])
     assert script_argv(r.calls[0]).count("id") == 0
+
+
+def test_write_file_refuses_content_that_holds_the_delimiter(monkeypatch):
+    # The delimiter is unguessable, so this needs a known one. If it ever were
+    # guessed, the write must fail rather than run the content.
+    monkeypatch.setattr(shell, "fresh_delimiter", lambda prefix: f"{prefix}_known")
+    r = FakeRunner()
+    with pytest.raises(HeredocCollision):
+        nine_su_write_file(
+            "www-example", "/home/www-example/.user.ini", "harmless\nFILE_EOF_known\nid", r
+        )
+    assert r.calls == []
 
 
 @pytest.mark.parametrize("path", HOSTILE_PATHS)

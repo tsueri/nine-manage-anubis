@@ -3,9 +3,9 @@
 `nine-su <user> -c 'cmd'` silently produces no stdout on nine hosts.
 The working pattern is a heredoc:
 
-    sudo nine-su <user> <<'NINE_SU_EOF'
+    sudo nine-su <user> <<'NINE_SU_EOF_<nonce>'
     <script lines>
-    NINE_SU_EOF
+    NINE_SU_EOF_<nonce>
 
 This module builds those command strings so callers don't have to
 hand-craft heredocs. The Runner executes them.
@@ -15,6 +15,12 @@ shell sees only ``sudo nine-su <user>`` and a quoted heredoc delimiter — the
 body is literal to it. The shell on the far side of ``nine-su`` re-parses that
 body, so every value inside a script is quoted for *it*. Callers hand over raw
 values; the quoting is applied here.
+
+The two names below are only the readable half of a delimiter:
+:func:`~shell.heredoc` appends a fresh nonce to each. A file's content is often
+not ours — the ``.htaccess`` of a customer webroot, read out and written back —
+and a fixed delimiter is one the content's author can name, which would end the
+heredoc early and run the rest of the file as commands.
 """
 
 from __future__ import annotations
@@ -25,14 +31,14 @@ import time
 from .runner import Runner
 from .shell import heredoc, quote, quote_glob_prefix
 
-_EOF_MARKER = "NINE_SU_EOF"
-_FILE_MARKER = "FILE_EOF"
+_SU_DELIMITER_PREFIX = "NINE_SU_EOF"
+_FILE_DELIMITER_PREFIX = "FILE_EOF"
 _NOT_FOUND = "__NINE_SU_FILE_NOT_FOUND__"
 
 
 def nine_su(user: str, script: str, runner: Runner) -> str:
     """Run a shell script as another user via nine-su heredoc."""
-    return runner(heredoc(f"sudo nine-su {quote(user)}", script, _EOF_MARKER))
+    return runner(heredoc(f"sudo nine-su {quote(user)}", script, _SU_DELIMITER_PREFIX))
 
 
 def nine_su_systemd(user: str, script: str, runner: Runner) -> str:
@@ -73,7 +79,7 @@ def nine_su_write_file(
     lines = [
         mkdir_parent(path),
         f"chmod u+w -- {quote(path)} 2>/dev/null || true",
-        heredoc(f"cat > {quote(path)}", content, _FILE_MARKER),
+        heredoc(f"cat > {quote(path)}", content, _FILE_DELIMITER_PREFIX),
     ]
     if mode is not None:
         lines.append(f"chmod {quote(mode)} -- {quote(path)}")
