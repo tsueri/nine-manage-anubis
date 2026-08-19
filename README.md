@@ -11,6 +11,15 @@ Automates the full Anubis lifecycle: installation, enabling/disabling protection
 
 For detailed documentation of every command and flag, see [docs/cli-reference.md](docs/cli-reference.md).
 
+## About Anubis
+
+[Anubis](https://github.com/TecharoHQ/anubis) is an open-source project that
+protects websites from AI scrapers and bots. It is developed by
+[TecharoHQ](https://github.com/TecharoHQ) and licensed under the MIT License.
+
+If Anubis helps protect your sites, please consider supporting the developer
+via [GitHub Sponsors](https://github.com/sponsors/TecharoHQ).
+
 ## Requirements
 
 - Python 3.10+ (stdlib only — no pip dependencies)
