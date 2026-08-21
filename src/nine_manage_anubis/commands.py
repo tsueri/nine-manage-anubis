@@ -748,7 +748,10 @@ def cmd_disable(
     if template != PROXY_TEMPLATE:
         env_port = port_claimed_for(anubis_user, domain, runner=runner)
         if env_port is None:
-            result.error = f"{domain} is not behind Anubis (template is {template})"
+            result.error = (
+                f"{domain} is not behind Anubis: template is {template}, "
+                f"and no env file claims a port pair"
+            )
             return result
 
     # The webroot and the user are only needed to tear the instance down, but

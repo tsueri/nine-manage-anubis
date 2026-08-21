@@ -361,19 +361,35 @@ def test_enable_cutover_only():
 # --- disable ------------------------------------------------------------------
 
 
+def _describes_teardown(report: str, domain: str) -> None:
+    """The four teardown steps every disable dry run describes, in order.
+
+    One helper, not four copied assertions: `_describe_disable` appends these
+    in one place, and the tests that pin them should read it back the same way.
+    """
+    assert f"Stop + disable anubis@{domain}.service" in report
+    assert f"Remove origin vhost origin-{domain}" in report
+    assert "Restore fixup files" in report
+    assert "Remove env file + key" in report
+
+
 def test_disable_dry_run_last_vhost():
     r = _base_runner()
     result = cmd_disable("test.example.ch", runner=r, dry_run=True)
     assert result.success
     steps_text = " ".join(result.steps)
-    assert "tear down" in steps_text.lower() or "last vhost" in steps_text.lower()
+    assert "Switch test.example.ch back to default_letsencrypt_https" in steps_text
+    assert "This is the last vhost on port 7010" in steps_text
+    _describes_teardown(steps_text, "test.example.ch")
 
 
 def test_disable_not_behind_anubis():
     r = _base_runner()
     result = cmd_disable("example.com", runner=r)
     assert not result.success
-    assert "not behind" in result.error
+    assert "not behind Anubis" in result.error
+    assert "template is default_letsencrypt_https" in result.error
+    assert "no env file claims a port pair" in result.error
 
 
 def test_disable_vhost_not_found():
@@ -1197,14 +1213,18 @@ def test_a_dry_run_reports_the_missing_field_too(missing):
 
 
 def test_disable_says_not_behind_anubis_before_it_says_anything_else():
-    """The template is what an operator asked about; a missing webroot only
-    matters once there is an instance to tear down."""
+    """The refusal names both absences, and lands before a missing webroot is
+    even mentioned — the webroot only matters once there is an instance to
+    tear down."""
     r = _base_runner(**{
         "sudo nine-manage-vhosts virtual-host list --json": VHOST_WITHOUT["webroot"],
     })
     result = cmd_disable("example.com", runner=r)
     assert not result.success
     assert "not behind Anubis" in result.error
+    assert "template is default_letsencrypt_https" in result.error
+    assert "no env file claims a port pair" in result.error
+    assert "webroot" not in result.error.lower()
 
 
 def test_one_wording_for_a_probe_that_could_not_be_made():
@@ -1587,6 +1607,7 @@ def test_disable_dry_run_prepared_skips_the_switch_and_describes_the_teardown():
     report = " ".join(result.steps)
     assert "tear down" in report
     assert f"Switch {PREPARED} back" not in report
+    _describes_teardown(report, PREPARED)
 
 
 def test_an_env_file_that_claims_no_port_pair_is_still_not_behind_anubis():
@@ -1601,17 +1622,33 @@ def test_an_env_file_that_claims_no_port_pair_is_still_not_behind_anubis():
 
     assert not result.success
     assert "not behind Anubis" in result.error
+    assert "no env file claims a port pair" in result.error
     assert not _issued(r, SWITCH_AWAY)
 
 
+# The prepared state, plus a live sibling whose public vhost is already
+# proxying to the prepared instance's port — the refcount case where the
+# instance stays. Composed from VHOSTS_PREPARED so the prepared half cannot
+# drift from the canonical fixture.
+VHOSTS_PREPARED_WITH_LIVE_SIBLING = json.dumps(
+    json.loads(VHOSTS_PREPARED)
+    + [
+        {
+            "domain": "blog.example.ch",
+            "user": "www-anubis",
+            "webroot": PREPARED_WEBROOT,
+            "template": "proxy_letsencrypt_https_redirect",
+            "template_variables": {"PROXYPORT": f"{PREPARED_PORT}"},
+            "aliases": [],
+            "jobs": [],
+        }
+    ]
+)
+
+
 def test_a_prepared_domain_sharing_its_port_with_a_live_vhost_is_left_running():
-    vhosts = """[
-      {"domain": "prepared.example.ch", "user": "www-anubis", "webroot": "/home/www-anubis/prepared.example.ch", "template": "default_letsencrypt_https", "template_variables": {}, "aliases": [], "jobs": []},
-      {"domain": "blog.example.ch", "user": "www-anubis", "webroot": "/home/www-anubis/prepared.example.ch", "template": "proxy_letsencrypt_https_redirect", "template_variables": {"PROXYPORT": "7020"}, "aliases": [], "jobs": []},
-      {"domain": "origin-prepared.example.ch", "user": "www-anubis", "webroot": "/home/www-anubis/prepared.example.ch", "template": "default_snakeoil_https", "template_variables": {"PHP_VERSION": "8.2"}, "aliases": [], "jobs": []}
-    ]"""
     r = _prepared_runner(**{
-        "sudo nine-manage-vhosts virtual-host list --json": vhosts,
+        "sudo nine-manage-vhosts virtual-host list --json": VHOSTS_PREPARED_WITH_LIVE_SIBLING,
     })
     result = cmd_disable(PREPARED, runner=r)
 
@@ -1622,6 +1659,20 @@ def test_a_prepared_domain_sharing_its_port_with_a_live_vhost_is_left_running():
     assert "left running" in report
     assert not _teardown_was_attempted(r)
     assert not _issued(r, SWITCH_AWAY)
+
+
+def test_disable_dry_run_prepared_with_a_live_sibling_reports_it_stays_running():
+    r = _prepared_runner(**{
+        "sudo nine-manage-vhosts virtual-host list --json": VHOSTS_PREPARED_WITH_LIVE_SIBLING,
+    })
+    result = cmd_disable(PREPARED, runner=r, dry_run=True)
+
+    assert result.success
+    report = " ".join(result.steps)
+    assert "blog.example.ch" in report
+    assert "stays running" in report
+    assert f"Switch {PREPARED} back" not in report
+    assert "tear down" not in report
 
 
 # The prepared path's teardown steps and what must be back in place when each

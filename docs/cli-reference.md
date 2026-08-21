@@ -481,7 +481,7 @@ An undo that itself fails is reported as a warning naming what needs manual clea
 
 Restoring the fixups is the one step made of several file writes, so it registers its undo *before* it runs: a write that fails half way through has changed the webroot without finishing, and that is the state most in need of undoing. Reinstalling them is an inverse in effect rather than byte for byte — the fixups are rewritten from the templates, with fresh backups.
 
-A dry run describes the host as it stands and cannot promise the teardown verdict: the real run re-reads the refcount immediately before the first destructive step and may find a sibling that appeared in between.
+A dry run describes the host as it stands and cannot promise the teardown verdict: the real run re-reads the refcount immediately before the first destructive step and may find a sibling that appeared in between. For a domain that was only prepared there is no switch step to describe, so its dry run starts at the refcount verdict — either the instance stays running because other vhosts still serve the port, or the teardown steps follow.
 
 #### Examples
 
@@ -502,7 +502,7 @@ nine-manage-anubis --dry-run disable example.com
 #### Errors
 
 - `Vhost <domain> not found` — the domain doesn't exist.
-- `<domain> is not behind Anubis (template is <template>)` — the vhost isn't using the proxy template and no env file claims a port pair for it.
+- `<domain> is not behind Anubis: template is <template>, and no env file claims a port pair` — neither marker of an instance is present: the vhost isn't using the proxy template, and no env file records the port pair the state `enable --prepare-only` leaves behind.
 - `Cannot determine PROXYPORT for <domain>` — the vhost is on the proxy template but has no `PROXYPORT` variable (malformed config).
 - `No domains to disable.` (exit code 1) — `--all` found no Anubis-protected vhosts for the user, or no domains were given.
 
