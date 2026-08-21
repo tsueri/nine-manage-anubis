@@ -712,7 +712,7 @@ restores `HTTP_HOST` from it. On the OG path that header is absent, so the origi
 sees `Host: origin-<domain>`, WordPress multisite doesn't recognise the site, and
 the fetch is redirected to `wp-signup.php?new=origin-<domain>`. Go's HTTP client
 then follows that redirect out to the public hostname while the transport still
-pins SNI to `origin-<domain>`, so nginx answers **421 Misdirected Request**.
+pins SNI to `origin-<domain>`, so Apache answers **421 Misdirected Request**.
 Anubis treats the non-200 as "no tags", caches an **empty** map for the full
 `ttl` (24h), and renders the challenge page with no OG tags at all. It fails
 silently — nothing is logged above debug level.
