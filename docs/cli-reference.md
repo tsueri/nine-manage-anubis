@@ -430,7 +430,7 @@ nine-manage-anubis --dry-run enable --all --user www-example --prepare-only --no
 
 ### disable
 
-Remove Anubis protection from a vhost. Switches the public vhost back to `default_letsencrypt_https`. If this was the last vhost on the instance's port, tears down the instance entirely. If other vhosts still share the instance, the instance stays running.
+Remove Anubis protection from a vhost. Switches the public vhost back to `default_letsencrypt_https` if it was behind Anubis. If this was the last vhost on the instance's port, tears down the instance entirely. If other vhosts still share the instance, the instance stays running.
 
 #### Synopsis
 
@@ -451,9 +451,9 @@ nine-manage-anubis disable --all --user <user>
 
 For each domain, in order:
 
-1. **Validate** the vhost exists and is behind Anubis (template is `proxy_letsencrypt_https_redirect`).
-2. **Switch the public vhost** back to `default_letsencrypt_https`.
-3. **Re-read which vhosts are on the instance's port**, now that this one is no longer among them. This happens immediately before the first destructive step, never from an earlier listing — a listing taken before the switch predates any concurrent `enable`, and acting on it can tear down an instance other live vhosts are still proxying to. The window is narrowed, not closed: a sibling is visible once its public vhost is on the port, so an `enable` that has claimed the instance but not yet cut its vhost over is still missed.
+1. **Validate** the vhost exists, and that there is an instance to disable. An instance exists either when the vhost is behind Anubis (template is `proxy_letsencrypt_https_redirect`) or when an env file still claims a port pair for the domain — the state `enable --prepare-only` leaves behind, with the instance fully built and the public vhost still on its old template. A domain with neither is refused.
+2. **Switch the public vhost** back to `default_letsencrypt_https` — only when it was behind Anubis. A domain that was only prepared was never switched, so this step is skipped and the teardown is the whole job.
+3. **Re-read which vhosts are on the instance's port**, immediately before the first destructive step — never from a listing taken earlier. A listing taken before the switch predates any concurrent `enable`, and acting on it can tear down an instance other live vhosts are still proxying to. The window is narrowed, not closed: a sibling is visible once its public vhost is on the port, so an `enable` that has claimed the instance but not yet cut its vhost over is still missed.
 4. **If other vhosts still share the port**, the instance stays running and nothing else is touched. The output names the remaining vhosts: "`Instance still serving: other.com, third.com — left running`"
 5. **If this was the last vhost** on the port, tear down the instance:
    - Stop + disable `anubis@<domain>.service`
@@ -463,7 +463,7 @@ For each domain, in order:
 
 #### Rollback
 
-Every step above carries its undo. If any of them fails, the ones before it are put back in reverse order — the env file and key rewritten with the content and mode they had, the fixups reinstalled, the origin vhost recreated with the PHP version it had, the service restarted, and the public vhost switched back to Anubis — and the output names each artifact that went back:
+Every step above carries its undo. If any of them fails, the ones before it are put back in reverse order — the env file and key rewritten with the content and mode they had, the fixups reinstalled, the origin vhost recreated with the PHP version it had, the service restarted, and (when there was a switch) the public vhost switched back to Anubis — and the output names each artifact that went back:
 
 ```
 Disable example.com:
@@ -477,11 +477,11 @@ Error: Disable failed: nine-manage-vhosts failed (exit 1) while removing vhost o
 stderr: ... Rolled back 2 of 2 step(s).
 ```
 
-An undo that itself fails is reported as a warning naming what needs manual cleanup, and the remaining undos still run — the last one on the stack is the public vhost, i.e. whether the site is being served at all.
+An undo that itself fails is reported as a warning naming what needs manual cleanup, and the remaining undos still run — when there was a switch, the last one on the stack is the public vhost, i.e. whether the site is being served at all.
 
 Restoring the fixups is the one step made of several file writes, so it registers its undo *before* it runs: a write that fails half way through has changed the webroot without finishing, and that is the state most in need of undoing. Reinstalling them is an inverse in effect rather than byte for byte — the fixups are rewritten from the templates, with fresh backups.
 
-A dry run describes the host as it stands and cannot promise the teardown verdict: the real run re-reads the refcount after the switch and may find a sibling that appeared in between.
+A dry run describes the host as it stands and cannot promise the teardown verdict: the real run re-reads the refcount immediately before the first destructive step and may find a sibling that appeared in between.
 
 #### Examples
 
@@ -502,7 +502,7 @@ nine-manage-anubis --dry-run disable example.com
 #### Errors
 
 - `Vhost <domain> not found` — the domain doesn't exist.
-- `<domain> is not behind Anubis (template is <template>)` — the vhost isn't using the proxy template.
+- `<domain> is not behind Anubis (template is <template>)` — the vhost isn't using the proxy template and no env file claims a port pair for it.
 - `Cannot determine PROXYPORT for <domain>` — the vhost is on the proxy template but has no `PROXYPORT` variable (malformed config).
 - `No domains to disable.` (exit code 1) — `--all` found no Anubis-protected vhosts for the user, or no domains were given.
 

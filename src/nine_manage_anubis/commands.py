@@ -18,6 +18,7 @@ from .ports import (
     discover_instances,
     find_vhosts_for_port,
     get_vhost,
+    port_claimed_for,
 )
 from .vhosts import (
     create_origin_vhost,
@@ -483,7 +484,7 @@ class UndoStep:
     correctly both in the step that reports the undo working and in the
     warning that reports it failing, which is where an operator is least in
     the mood for a grammar puzzle. And `enable` and `disable` undo the same
-    six artifacts in opposite directions, so naming the artifact makes the two
+    artifacts in opposite directions, so naming the artifact makes the two
     commands describe one instance with one vocabulary.
     """
 
@@ -496,8 +497,8 @@ def _rollback(undo_stack: list[UndoStep], result: CommandResult) -> int:
 
     Best-effort by design: an undo that fails is reported and the rest still
     run. Stopping at the first failure would strand the artifacts below it —
-    and the one at the bottom of the stack is the public vhost, i.e. whether
-    the site is being served at all.
+    and on a cut-over teardown the one at the bottom of the stack is the
+    public vhost, i.e. whether the site is being served at all.
     """
     undone = 0
     for step in reversed(undo_stack):
@@ -736,9 +737,19 @@ def cmd_disable(
         result.error = str(e)
         return result
 
+    # Whether the public vhost is on the proxy template decides only how much
+    # of the teardown applies — not whether there is an instance at all.
+    # `enable --prepare-only` leaves a whole instance behind while the public
+    # vhost is still on its old template, and the env file's port claim is the
+    # marker that tells that state apart from a domain with no instance: it
+    # exists exactly in the prepared state, and records the port the refcount
+    # check below has to read.
+    env_port: int | None = None
     if template != PROXY_TEMPLATE:
-        result.error = f"{domain} is not behind Anubis (template is {template})"
-        return result
+        env_port = port_claimed_for(anubis_user, domain, runner=runner)
+        if env_port is None:
+            result.error = f"{domain} is not behind Anubis (template is {template})"
+            return result
 
     # The webroot and the user are only needed to tear the instance down, but
     # they are read here anyway: a disable that switched the template and then
@@ -751,14 +762,20 @@ def cmd_disable(
         result.error = str(e)
         return result
 
-    tv = vh.get("template_variables", {})
-    port = int(tv.get("PROXYPORT", 0))
-    if not port:
-        result.error = f"Cannot determine PROXYPORT for {domain}"
-        return result
+    if env_port is not None:
+        # Prepared but never cut over: the vhost was never on the proxy
+        # template, so there is nothing to switch back — the teardown below
+        # is the whole job.
+        port = env_port
+    else:
+        tv = vh.get("template_variables", {})
+        port = int(tv.get("PROXYPORT", 0))
+        if not port:
+            result.error = f"Cannot determine PROXYPORT for {domain}"
+            return result
 
     if dry_run:
-        _describe_disable(domain, port, runner, result)
+        _describe_disable(domain, port, runner, result, prepared=env_port is not None)
         return result
 
     # Read before breaking: the origin vhost is the one artifact whose shape
@@ -770,18 +787,21 @@ def cmd_disable(
 
     undo_stack: list[UndoStep] = []
     try:
-        switch_to_default(domain, no_notify=no_notify, runner=runner)
-        undo_stack.append(UndoStep(
-            _public_vhost(domain),
-            lambda: switch_to_proxy(domain, port, no_notify=no_notify, runner=runner),
-        ))
-        result.steps.append(f"Switched {domain} back to {DEFAULT_LE_TEMPLATE}")
+        if env_port is None:
+            switch_to_default(domain, no_notify=no_notify, runner=runner)
+            undo_stack.append(UndoStep(
+                _public_vhost(domain),
+                lambda: switch_to_proxy(domain, port, no_notify=no_notify, runner=runner),
+            ))
+            result.steps.append(f"Switched {domain} back to {DEFAULT_LE_TEMPLATE}")
 
-        # The refcount is read *here*, after the switch and immediately before
-        # the first destructive step, and never from a listing taken earlier.
-        # A listing from before the switch still counts this vhost, and — worse
-        # — predates any concurrent enable, so acting on it can tear down an
-        # instance other live vhosts are proxying to.
+        # The refcount is read *here*, immediately before the first destructive
+        # step, and never from a listing taken earlier. A listing from before
+        # the switch still counts this vhost, and — worse — predates any
+        # concurrent enable, so acting on it can tear down an instance other
+        # live vhosts are proxying to. A prepared domain was never on the port,
+        # so for it the read happens with nothing switched yet; the guarantee
+        # is the same.
         #
         # Narrowed, not closed: this sees a sibling once its public vhost is on
         # the port, so an enable that has claimed the instance but not yet cut
@@ -817,15 +837,23 @@ def _other_vhosts_on_port(domain: str, port: int, runner: Runner) -> list[str]:
 
 
 def _describe_disable(
-    domain: str, port: int, runner: Runner, result: CommandResult
+    domain: str,
+    port: int,
+    runner: Runner,
+    result: CommandResult,
+    *,
+    prepared: bool = False,
 ) -> None:
     """What a disable would do, from the listing as it stands now.
 
     A dry run cannot promise the teardown verdict, because the real run
     re-reads the refcount after switching the vhost away and may find a
-    sibling that appeared in between. It describes the host as it is.
+    sibling that appeared in between. It describes the host as it is. A
+    prepared domain has no vhost to switch, so its description starts at the
+    refcount.
     """
-    result.steps.append(f"Switch {domain} back to {DEFAULT_LE_TEMPLATE}")
+    if not prepared:
+        result.steps.append(f"Switch {domain} back to {DEFAULT_LE_TEMPLATE}")
     others = _other_vhosts_on_port(domain, port, runner)
     if others:
         result.steps.append(
@@ -833,7 +861,14 @@ def _describe_disable(
             f"instance stays running"
         )
         return
-    result.steps.append(f"This is the last vhost on port {port} — would tear down instance:")
+    if prepared:
+        result.steps.append(
+            f"No live vhosts on port {port} — would tear down instance:"
+        )
+    else:
+        result.steps.append(
+            f"This is the last vhost on port {port} — would tear down instance:"
+        )
     result.steps.append(f"  Stop + disable {_service(domain)}")
     result.steps.append(f"  Remove {_origin_vhost(domain)}")
     result.steps.append("  Restore fixup files")

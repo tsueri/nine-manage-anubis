@@ -1,6 +1,8 @@
 """Tests for commands.py — command implementations."""
 
+import json
 import posixpath
+import re
 
 import pytest
 
@@ -1255,10 +1257,22 @@ class _RunnerFailingAt(FakeRunner):
     builds it, so a test says "the host refused to stop the service" rather
     than "this call raised" — which is what an operator hits, and what stays
     true across a refactor.
+
+    ``base_responses`` replaces the canned base runner for hosts in another
+    state — a prepared instance — so the same injection works there without
+    a second class.
     """
 
-    def __init__(self, *needles: str, **responses: str):
-        super().__init__(_base_runner(**responses).responses)
+    def __init__(
+        self,
+        *needles: str,
+        base_responses: dict[str, str] | None = None,
+        **responses: str,
+    ):
+        if base_responses is None:
+            super().__init__(_base_runner(**responses).responses)
+        else:
+            super().__init__({**base_responses, **responses})
         self._pending = list(needles)
 
     def __call__(self, cmd, **kwargs):
@@ -1483,3 +1497,296 @@ def test_the_vhost_asked_about_is_still_switched_off_anubis():
 
     assert _issued(r, SWITCH_AWAY)
     assert any("Switched" in s for s in result.steps)
+
+
+# --- disable tears down an instance that was prepared but never cut over ------
+#
+# `enable --prepare-only` leaves a whole instance behind — env file, key,
+# running service, origin vhost, fixups — while the public vhost is still on
+# its old template. The proxy template therefore cannot be how a disable knows
+# the instance exists: the env file's port claim is the marker, and the
+# teardown that follows it is the cut-over path's own, minus the template
+# switch there is nothing to switch back.
+
+PREPARED = "prepared.example.ch"
+PREPARED_WEBROOT = "/home/www-anubis/prepared.example.ch"
+PREPARED_PORT = 7020
+PREPARED_ENV = f"/home/www-anubis/.config/anubis/{PREPARED}.env"
+PREPARED_KEY = f"/home/www-anubis/.config/anubis/{PREPARED}.key"
+
+# The state `enable --prepare-only` leaves behind: the public vhost on its
+# original template, the origin vhost and the env file all present, nothing on
+# the proxy template.
+VHOSTS_PREPARED = json.dumps([
+    {
+        "domain": PREPARED,
+        "user": "www-anubis",
+        "webroot": PREPARED_WEBROOT,
+        "template": "default_letsencrypt_https",
+        "template_variables": {"TIMEOUT": "300", "PHP_VERSION": "8.2", "MODSEC": "Off"},
+        "aliases": [],
+        "jobs": [],
+    },
+    {
+        "domain": f"origin-{PREPARED}",
+        "user": "www-anubis",
+        "webroot": PREPARED_WEBROOT,
+        "template": "default_snakeoil_https",
+        "template_variables": {"PHP_VERSION": "8.2"},
+        "aliases": [],
+        "jobs": [],
+    },
+])
+
+
+def _prepared_runner(**overrides) -> FakeRunner:
+    """Runner for the state `enable --prepare-only` leaves behind."""
+    responses = {
+        "sudo nine-manage-vhosts virtual-host list --json": VHOSTS_PREPARED,
+        _SU + f"cat -- {PREPARED_ENV}": (
+            f"BIND=:{PREPARED_PORT}\nMETRICS_BIND=:{PREPARED_PORT + 1}\n"
+            f"TARGET_HOST=origin-{PREPARED}\n"
+        ),
+        _SU + f"cat -- {PREPARED_KEY}": "0123456789abcdef\n",
+    }
+    responses.update(overrides)
+    return _base_runner(**responses)
+
+
+PREP_REMOVE_ORIGIN = f"virtual-host remove origin-{PREPARED}"
+PREP_RECREATE_ORIGIN = f"virtual-host create origin-{PREPARED}"
+PREP_RESTORE_FIXUPS = f"rm -f -- {PREPARED_WEBROOT}/.user.ini"
+PREP_REINSTALL_FIXUPS = f"cat > {PREPARED_WEBROOT}/anubis-origin-shim.php"
+PREP_REMOVE_ENV = f"rm -f -- {PREPARED_ENV}"
+PREP_REMOVE_KEY = f"rm -f -- {PREPARED_KEY}"
+PREP_RESTORE_ENV = f"cat > {PREPARED_ENV}"
+
+
+def test_disable_tears_down_an_instance_that_was_prepared_but_never_cut_over():
+    r = _prepared_runner()
+    result = cmd_disable(PREPARED, runner=r)
+
+    assert result.success
+    report = " ".join(result.steps)
+    assert "Stopped" in report
+    assert f"origin-{PREPARED}" in report
+    assert "env file + key" in report
+    assert not any("Switched" in s for s in result.steps)
+    assert not _issued(r, SWITCH_AWAY)
+    assert _issued(r, STOP_SERVICE)
+    assert _issued(r, PREP_REMOVE_ORIGIN)
+    assert _issued(r, PREP_REMOVE_ENV)
+    assert _issued(r, PREP_REMOVE_KEY)
+
+
+def test_disable_dry_run_prepared_skips_the_switch_and_describes_the_teardown():
+    r = _prepared_runner()
+    result = cmd_disable(PREPARED, runner=r, dry_run=True)
+
+    assert result.success
+    report = " ".join(result.steps)
+    assert "tear down" in report
+    assert f"Switch {PREPARED} back" not in report
+
+
+def test_an_env_file_that_claims_no_port_pair_is_still_not_behind_anubis():
+    """The env file is the marker only because it records the pair."""
+    r = _prepared_runner(**{
+        _SU + f"cat -- {PREPARED_ENV}": (
+            f"METRICS_BIND=:{PREPARED_PORT + 1}\n"
+            f"TARGET_HOST=origin-{PREPARED}\n"
+        ),
+    })
+    result = cmd_disable(PREPARED, runner=r)
+
+    assert not result.success
+    assert "not behind Anubis" in result.error
+    assert not _issued(r, SWITCH_AWAY)
+
+
+def test_a_prepared_domain_sharing_its_port_with_a_live_vhost_is_left_running():
+    vhosts = """[
+      {"domain": "prepared.example.ch", "user": "www-anubis", "webroot": "/home/www-anubis/prepared.example.ch", "template": "default_letsencrypt_https", "template_variables": {}, "aliases": [], "jobs": []},
+      {"domain": "blog.example.ch", "user": "www-anubis", "webroot": "/home/www-anubis/prepared.example.ch", "template": "proxy_letsencrypt_https_redirect", "template_variables": {"PROXYPORT": "7020"}, "aliases": [], "jobs": []},
+      {"domain": "origin-prepared.example.ch", "user": "www-anubis", "webroot": "/home/www-anubis/prepared.example.ch", "template": "default_snakeoil_https", "template_variables": {"PHP_VERSION": "8.2"}, "aliases": [], "jobs": []}
+    ]"""
+    r = _prepared_runner(**{
+        "sudo nine-manage-vhosts virtual-host list --json": vhosts,
+    })
+    result = cmd_disable(PREPARED, runner=r)
+
+    assert result.success
+    report = " ".join(result.steps)
+    assert "still serving" in report
+    assert "blog.example.ch" in report
+    assert "left running" in report
+    assert not _teardown_was_attempted(r)
+    assert not _issued(r, SWITCH_AWAY)
+
+
+# The prepared path's teardown steps and what must be back in place when each
+# fails. Same rows as TEARDOWN_STEPS, minus the template switch and its undo:
+# a prepared public vhost was never on Anubis, so there is nothing to switch.
+PREPARED_TEARDOWN_STEPS = [
+    pytest.param(STOP_SERVICE, [], id="stopping the service"),
+    pytest.param(PREP_REMOVE_ORIGIN, [START_SERVICE], id="removing the origin vhost"),
+    pytest.param(
+        PREP_RESTORE_FIXUPS,
+        [PREP_REINSTALL_FIXUPS, PREP_RECREATE_ORIGIN, START_SERVICE],
+        id="restoring the webroot fixups",
+    ),
+    pytest.param(
+        PREP_REMOVE_ENV,
+        [PREP_REINSTALL_FIXUPS, PREP_RECREATE_ORIGIN, START_SERVICE],
+        id="removing the env file",
+    ),
+    pytest.param(
+        PREP_REMOVE_KEY,
+        [PREP_RESTORE_ENV, PREP_REINSTALL_FIXUPS, PREP_RECREATE_ORIGIN, START_SERVICE],
+        id="removing the key file",
+    ),
+]
+
+
+@pytest.mark.parametrize("failing_step,expected_undos", PREPARED_TEARDOWN_STEPS)
+def test_a_failed_prepared_teardown_step_puts_the_preceding_ones_back(
+    failing_step, expected_undos
+):
+    r = _RunnerFailingAt(failing_step, base_responses=_prepared_runner().responses)
+    result = cmd_disable(PREPARED, runner=r)
+
+    assert not result.success
+    assert "Disable failed" in result.error
+    for undo in expected_undos:
+        assert _issued(r, undo), f"{undo} was never issued"
+
+
+@pytest.mark.parametrize("failing_step,expected_undos", PREPARED_TEARDOWN_STEPS)
+def test_a_failed_prepared_teardown_reports_which_steps_were_undone(
+    failing_step, expected_undos
+):
+    r = _RunnerFailingAt(failing_step, base_responses=_prepared_runner().responses)
+    result = cmd_disable(PREPARED, runner=r)
+
+    rolled_back = [s for s in result.steps if s.startswith("Rolled back:")]
+    assert len(rolled_back) == len(expected_undos)
+    assert f"Rolled back {len(expected_undos)}" in result.error
+
+
+def test_a_failed_prepared_teardown_never_touches_the_public_vhost():
+    """The deepest failure would undo the most steps — none of them a switch."""
+    r = _RunnerFailingAt(PREP_REMOVE_KEY, base_responses=_prepared_runner().responses)
+    result = cmd_disable(PREPARED, runner=r)
+
+    assert not result.success
+    assert not _issued(r, SWITCH_AWAY)
+    assert not _issued(r, SWITCH_BACK)
+
+
+class _PreparedHostSim(FakeRunner):
+    """A host that keeps the facts `enable` writes and `disable` removes.
+
+    The vhost list and the instance's env and key files are real state here —
+    the env file stops being listed once it is removed, the origin vhost stops
+    existing once it is removed — because those are what `uninstall`'s
+    instance scan reads to decide whether anything is left. Everything else
+    answers from the canned base runner.
+    """
+
+    def __init__(self):
+        super().__init__(_base_runner().responses)
+        self.vhosts: list[dict] = [
+            {
+                "domain": PREPARED,
+                "user": "www-anubis",
+                "webroot": PREPARED_WEBROOT,
+                "template": "default_letsencrypt_https",
+                "template_variables": {},
+                "aliases": [],
+                "jobs": [],
+            },
+        ]
+        self.env_files: dict[str, str] = {}
+        self.key_files: dict[str, str] = {}
+
+    def __call__(self, cmd, **kwargs):
+        canned = super().__call__(cmd, **kwargs)
+
+        if cmd.startswith("sudo nine-manage-vhosts virtual-host list --json"):
+            return json.dumps(self.vhosts)
+        if cmd.startswith("sudo nine-manage-vhosts virtual-host create "):
+            self.vhosts.append(self._parse_create(cmd))
+            return ""
+        if cmd.startswith("sudo nine-manage-vhosts virtual-host remove "):
+            domain = cmd.split("virtual-host remove ", 1)[1].split()[0]
+            self.vhosts = [vh for vh in self.vhosts if vh["domain"] != domain]
+            return ""
+        if "ls ~/.config/anubis/*.env" in cmd:
+            return "".join(f"{path}\n" for path in sorted(self.env_files))
+        if "rm -f -- " in cmd:
+            for word in cmd.split():
+                if "/.config/anubis/" in word:
+                    self.env_files.pop(word, None)
+                    self.key_files.pop(word, None)
+        if "cat -- " in cmd:
+            for path, content in {**self.env_files, **self.key_files}.items():
+                if f"cat -- {path}" in cmd:
+                    return content
+        for path, content in self._heredoc_writes(cmd):
+            if path.endswith(".env"):
+                self.env_files[path] = content
+            elif path.endswith(".key"):
+                self.key_files[path] = content
+        return canned
+
+    @staticmethod
+    def _heredoc_writes(cmd: str) -> list[tuple[str, str]]:
+        return [
+            (path, body)
+            for path, body in re.findall(
+                r"cat > (\S+) <<'FILE_EOF(?:_[0-9a-f]+)?'\n(.*?)\nFILE_EOF(?:_[0-9a-f]+)?(?!\S)",
+                cmd,
+                re.DOTALL,
+            )
+        ]
+
+    @staticmethod
+    def _parse_create(cmd: str) -> dict:
+        parts = cmd[len("sudo nine-manage-vhosts virtual-host create "):].split()
+        opts: dict[str, str] = {}
+        tv: dict[str, str] = {}
+        for word in parts[1:]:
+            if word.startswith("--template-variable="):
+                key, _, value = word[len("--template-variable="):].partition("=")
+                tv[key] = value
+            elif word.startswith("--") and "=" in word:
+                key, _, value = word.partition("=")
+                opts[key[2:]] = value
+        return {
+            "domain": parts[0],
+            "user": opts["user"],
+            "webroot": opts.get("webroot", ""),
+            "template": opts["template"],
+            "template_variables": tv,
+            "aliases": [],
+            "jobs": [],
+        }
+
+
+def test_prepare_only_then_disable_leaves_nothing_behind_and_uninstall_proceeds():
+    host = _PreparedHostSim()
+
+    prepared = cmd_enable(PREPARED, runner=host, prepare_only=True)
+    assert prepared.success
+    assert PREPARED_ENV in host.env_files
+    assert PREPARED_KEY in host.key_files
+    assert any(vh["domain"] == f"origin-{PREPARED}" for vh in host.vhosts)
+
+    disabled = cmd_disable(PREPARED, runner=host)
+    assert disabled.success
+    assert not host.env_files
+    assert not host.key_files
+    assert not any(vh["domain"].startswith("origin-") for vh in host.vhosts)
+
+    uninstall = cmd_uninstall(runner=host)
+    assert uninstall.success

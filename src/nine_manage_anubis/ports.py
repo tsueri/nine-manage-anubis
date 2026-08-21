@@ -385,6 +385,44 @@ def find_port_for_domain(
     return None
 
 
+def port_claimed_for(
+    anubis_user: str, domain: str, runner: Runner = SubprocessRunner()
+) -> int | None:
+    """The app port this domain's own env file claims, or None.
+
+    The marker `disable` uses for the state `enable --prepare-only` leaves
+    behind: the env file it wrote, under the user it was told. Read directly
+    rather than through a scan of every env file on the host — some other
+    domain's corrupt file must not turn a clean refusal into a crash, and the
+    teardown removes exactly this file, so this is the one whose claim
+    matters. A BIND that names nothing, or a port outside the allocation
+    range, claims nothing of ours; a BIND that is not a number is corruption
+    and raises, as it does everywhere else.
+    """
+    from .config import env_path_for
+
+    validate_system_user(anubis_user)
+    validate_domain(domain)
+    content = nine_su_read_file(
+        anubis_user, env_path_for(anubis_user, domain), runner
+    )
+    if content is None:
+        return None
+    bind = _parse_env_file(content).get("BIND", "")
+    match = re.match(r":(\d+)", bind)
+    if not match:
+        return None
+    port = validate_port(
+        match.group(1),
+        field="BIND port in env file",
+        minimum=MIN_TCP_PORT,
+        maximum=MAX_TCP_PORT,
+    )
+    if PORT_RANGE_START <= port <= PORT_RANGE_END:
+        return port
+    return None
+
+
 def find_prepared_port_for_webroot(
     webroot: str, exclude_domain: str | None = None, runner: Runner = SubprocessRunner()
 ) -> int | None:
