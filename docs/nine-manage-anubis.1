@@ -1,0 +1,528 @@
+.\" Manpage for nine-manage-anubis.
+.\" Licensed under the MIT License.
+.TH NINE\-MANAGE\-ANUBIS 1 "2026" "nine-manage-anubis 0.1.0" "User Commands"
+.SH NAME
+nine-manage-anubis \- manage Anubis bot protection on nine.ch Managed Servers
+.SH SYNOPSIS
+.B nine-manage-anubis
+.RI [ global\-options ]
+.I command
+.RI [ command\-options ]
+.SH DESCRIPTION
+.B nine-manage-anubis
+automates the full
+.BR Anubis
+(https://github.com/TecharoHQ/anubis) lifecycle on
+.B nine.ch
+Managed Servers: installation, enabling and disabling protection per
+virtual host (vhost), batch operations, upgrades with rolling restart,
+status reporting, and a self-test.
+.PP
+Anubis sits between two Apache vhosts. A public vhost on port 443 proxies
+to a per\-instance Anubis process listening on a loopback port in the
+7010\-7999 range, which in turn proxies to a private
+.BR origin\-\fIdomain\fR
+vhost serving the same webroot. Enabling a domain creates the instance,
+installs origin fixups in the webroot, and cuts the public vhost over to
+the proxy template.
+.PP
+Global options must appear
+.B before
+the subcommand; command options appear
+.B after
+it:
+.PP
+.RS 4
+nine-manage-anubis \-\-dry-run enable example.com \-\-prepare-only
+.RE
+.SH GLOBAL OPTIONS
+.TP
+.B \-\-dry\-run
+Show what would be done without making any changes. No files are written,
+no services are restarted, no vhosts are changed. Safe to run against
+production; use it before every batch operation.
+.TP
+.B \-\-json
+Emit results as JSON instead of human\-readable text. See
+.B OUTPUT FORMATS
+below.
+.TP
+.BI \-\-anubis\-user " USER"
+The system user that runs the Anubis binary and owns its config and key
+files. Defaults to the
+.B anubis_user
+field of the config file, or
+.BR www\-anubis .
+This is
+.B not
+the website user that owns the webroot.
+.SH COMMANDS
+.SS install
+Set up Anubis infrastructure on the server: create the system user,
+download the binary, and install the systemd template. Does not protect
+any domains; use
+.B enable
+for that.
+.PP
+.RS 4
+nine-manage-anubis install
+.RI [ \-\-version " VERSION" ]
+.RI [ \-\-init\-policy ]
+.RE
+.TP
+.BI \-\-version " VERSION"
+Anubis version to download. Must be a three\-part version without a leading
+.BR v ,
+matching a release tag from
+.IR https://github.com/TecharoHQ/anubis/releases .
+Defaults to the
+.B anubis_version
+config field, or
+.BR 1.27.0 .
+.TP
+.B \-\-init\-policy
+Extract the embedded default bot policy from the binary to the path
+configured in
+.BR policy_file .
+Ignored with a warning when
+.B policy_file
+is not set.
+.PP
+The command is idempotent: each step checks for existence before acting.
+.SS uninstall
+Remove Anubis infrastructure: the systemd template, the binary, and the
+system user. Refuses to run while any Anubis instance still exists,
+listing the exact
+.B disable
+commands to run first.
+.PP
+.RS 4
+nine-manage-anubis uninstall
+.RE
+.SS enable
+Put one or more vhosts behind Anubis.
+.PP
+.RS 4
+nine-manage-anubis enable
+.I domain
+.RI [ domain " ...]"
+.RI [ options ]
+.br
+nine-manage-anubis enable
+.B \-\-all \-\-user
+.I user
+.RI [ options ]
+.RE
+.TP
+.B \-\-prepare\-only
+Do everything except the cutover: generate the key, write the env file,
+install fixups, create the origin vhost, and start the service. The public
+vhost keeps serving directly, so there is no traffic impact.
+.TP
+.B \-\-cutover\-only
+Only perform the cutover: switch the public vhost to the proxy template.
+Assumes
+.B \-\-prepare\-only
+was run previously.
+.TP
+.B \-\-all
+Enable every vhost owned by
+.B \-\-user
+that is not yet behind Anubis. Requires
+.BR \-\-user .
+.TP
+.BI \-\-user " USER"
+Website user to filter
+.B \-\-all
+by (for example
+.BR www\-example ).
+.TP
+.BI \-\-skip " PATTERN"
+Skip domains matching a shell glob pattern. Repeatable. Example:
+.BR "\-\-skip 'vorlage*' \-\-skip '*.test'" .
+.TP
+.B \-\-no\-notify\-services
+Skip the Apache reload after each vhost change; reload once at the end of
+the batch instead.
+.PP
+The full flow for each domain is: validate the vhost; allocate (or reuse)
+a port pair; generate a JWT signing key; write the env file; install the
+systemd template if needed; install the origin fixups; create the
+.BR origin\-\fIdomain\fR
+vhost; start the service; create a Let's Encrypt certificate if needed;
+and cut over the public vhost. When a domain shares a webroot with an
+already\-protected vhost, the existing instance is reused and no new
+instance is created (multisite reuse).
+.PP
+If a step fails after changes have begun, all changes are rolled back in
+reverse order. See
+.B ROLLBACK
+below.
+.SS disable
+Remove Anubis protection from one or more vhosts.
+.PP
+.RS 4
+nine-manage-anubis disable
+.I domain
+.RI [ domain " ...]"
+.RI [ options ]
+.br
+nine-manage-anubis disable
+.B \-\-all \-\-user
+.I user
+.RI [ options ]
+.RE
+.TP
+.B \-\-all
+Disable every Anubis\-protected vhost owned by
+.BR \-\-user .
+Requires
+.BR \-\-user .
+.TP
+.BI \-\-user " USER"
+Website user to filter
+.B \-\-all
+by.
+.TP
+.BI \-\-skip " PATTERN"
+Skip domains matching a shell glob pattern. Repeatable.
+.TP
+.B \-\-no\-notify\-services
+Skip the Apache reload after each vhost change; reload once at the end of
+the batch instead.
+.PP
+The public vhost is switched back to its direct template. If it was the
+last vhost on the instance's port the instance is torn down (stop the
+service, remove the origin vhost, restore the fixup files, remove the env
+file and key). If other vhosts still share the port the instance is left
+running and nothing else is touched. A teardown that fails part\-way is
+rolled back.
+.SS upgrade
+Download a new Anubis binary and restart all instances. By default,
+restarts one instance at a time with a health check after each, stopping
+on the first failure.
+.PP
+.RS 4
+nine-manage-anubis upgrade
+.RI [ \-\-version " VERSION" ]
+.RI [ \-\-no\-rolling ]
+.RE
+.TP
+.BI \-\-version " VERSION"
+Target version to download. Defaults to the latest release resolved from
+the GitHub API.
+.TP
+.B \-\-no\-rolling
+Restart all instances at once instead of one by one. No health checks
+between restarts.
+.PP
+A rolling restart checks that the service is
+.B active
+and probes
+.B http://localhost:\fIport\fB/\fR
+with a routable client address (RFC 5737
+.BR 203.0.113.7 )
+in both the
+.B X\-Real\-Ip
+and
+.B X\-Forwarded\-For
+headers, expecting a 2xx or 3xx response. Any failure stops the roll;
+instances already restarted are on the new binary, the rest remain on the
+old one.
+.SS restart
+Restart all Anubis instances without downloading a new binary. Use after
+editing the shared policy file or any env file.
+.PP
+.RS 4
+nine-manage-anubis restart
+.RI [ \-\-no\-rolling ]
+.RE
+.TP
+.B \-\-no\-rolling
+Restart all instances at once instead of one by one.
+.PP
+The health\-check behavior is identical to
+.BR upgrade .
+.SS status
+List Anubis instances on the host. Instances are discovered by combining
+vhost configuration (assigned ports), env files (claimed ports), and
+systemd (running services).
+.PP
+.RS 4
+nine-manage-anubis status
+.RI [ \-\-domain " DOMAIN" ]
+.RI [ \-\-health ]
+.RE
+.TP
+.BI \-\-domain " DOMAIN"
+Filter by domain. Matches the instance's primary domain or any vhost
+proxying to its port.
+.TP
+.B \-\-health
+Actively curl each running instance and report its HTTP status. Inactive
+instances report
+.BR inactive .
+.PP
+The table has the columns
+.BR DOMAIN ,
+.BR PORT ,
+.BR METRICS ,
+.BR USER ,
+.BR STATE ,
+.BR VERSION ,
+and
+.BR VHOSTS ,
+plus
+.B HEALTH
+when
+.B \-\-health
+is given. The
+.B DOMAIN
+column names the instance (the first domain configured for the webroot);
+the
+.B VHOSTS
+column lists every domain protected by it.
+.SS self-test
+Verify infrastructure health: the user exists, the binary runs, the
+systemd template is installed, and every instance is active and
+HTTP\-responding. Any HTTP status code counts as a pass.
+.PP
+.RS 4
+nine-manage-anubis self-test
+.RE
+.PP
+Failures are reported as warnings with an error of
+.IR "\fIN\fB check(s) failed\fR" ;
+the process still exits 0, so inspect stderr or the JSON
+.B error
+field.
+.SS config
+Show current settings and the config file location, or create a starter
+config file.
+.PP
+.RS 4
+nine-manage-anubis config
+.RI [ \-\-init ]
+.RE
+.TP
+.B \-\-init
+Create a default config file at
+.IR ~/.config/nine\-manage\-anubis/config.json ,
+overwriting any existing file.
+.PP
+Without
+.BR \-\-init ,
+prints the config file path, whether it exists, and the effective values
+of
+.BR anubis_user ,
+.BR anubis_version ,
+and
+.BR policy_file .
+The
+.B config
+command remains reachable even when the config file is rejected or
+ignored, so a bad file cannot lock you out of the tool that repairs it.
+.SH CONFIGURATION FILE
+Defaults are read from
+.IR ~/.config/nine\-manage\-anubis/config.json .
+All fields are optional; a missing field or one set to
+.B null
+uses its default. Command\-line flags override file values.
+.PP
+.nf
+{
+    "anubis_user": "www-anubis",
+    "anubis_version": "1.27.0",
+    "policy_file": null
+}
+.fi
+.TP
+.B anubis_user
+System user that runs the Anubis binary. Default
+.BR www\-anubis .
+.TP
+.B anubis_version
+Default version for
+.B install
+and
+.BR upgrade .
+Default
+.BR 1.27.0 .
+.TP
+.B policy_file
+Absolute path to a shared bot policy. When set, every instance gets
+.B POLICY_FNAME=\fIpath\fR
+in its env file, so editing one file and running
+.B restart
+updates all instances. When
+.BR null ,
+instances use the embedded default policy.
+.PP
+A file that cannot be read or parsed is reported and the run continues on
+defaults. A file that parses but carries a malformed value is rejected and
+the run stops, because that value was about to be spliced into a
+.B sudo
+command.
+.SH INPUT VALIDATION
+Every domain, system user, version, and path reaches a
+.B sudo
+command, so each is first matched against a whitelist. A value that does
+not match is rejected with a message naming the value and the expected
+form, and the tool exits 1 before any command is built.
+.TP
+.B Domain
+Lowercase letters, digits, dots, and hyphens, as dot\-separated DNS
+labels; at most 253 characters.
+.TP
+.B System user
+.BR [a\-z_][a\-z0\-9_\-]* ,
+at most 32 characters.
+.TP
+.B Version
+Three\-part version, no leading
+.BR v .
+.TP
+.B Path
+Absolute; letters, digits,
+.BR . _ \- /
+only; no
+.B ..
+segment.
+.PP
+The same whitelist is applied to values read back from vhost JSON, env
+files, webroot files, the config file, and the GitHub releases API. A
+malformed value from any of those is treated as tampering and aborts the
+run; a well\-formed value that simply is not Anubis's is skipped.
+.SH OUTPUT FORMATS
+With
+.BR \-\-json ,
+.B status
+emits an array of objects with the keys
+.BR domain ,
+.BR port ,
+.BR metrics_port ,
+.BR user ,
+.BR state ,
+.BR version ,
+.BR vhosts ,
+.BR vhost_count ,
+and (with
+.BR \-\-health )
+.BR health .
+.PP
+Other commands emit a single object:
+.PP
+.nf
+{
+  "steps":    ["Step 1", "Step 2"],
+  "warnings": ["optional warning"],
+  "error":    "optional error message"
+}
+.fi
+.PP
+The
+.B warnings
+and
+.B error
+keys are omitted when empty. In human\-readable output, steps are printed
+as a numbered list under a title, warnings and errors go to standard error.
+With
+.BR \-\-dry\-run ,
+the title is prefixed with
+.BR "[DRY RUN]" .
+.SH EXIT STATUS
+.TP
+.B 0
+Success, or
+.B self-test
+completed (even with reported failures).
+.TP
+.B 1
+Input rejected by validation, a command failed, no domains were found to
+process, or at least one domain in a batch failed.
+.TP
+.B 2
+Argument parsing failed.
+.TP
+.B 130
+Interrupted (Ctrl\-C).
+.SH FILES
+.TP
+.I ~/.config/nine\-manage\-anubis/config.json
+Configuration file.
+.TP
+.I ~/.config/anubis/\fIdomain\fR.env
+Per\-instance environment file (mode 0600).
+.TP
+.I ~/.config/anubis/\fIdomain\fR.key
+Per\-instance JWT signing key (mode 0600).
+.TP
+.I ~/.config/systemd/user/anubis@.service
+Systemd user\-service template.
+.TP
+.I ~/bin/anubis
+The Anubis binary.
+.TP
+.I /run/lock/nine\-manage\-anubis\-ports.lock
+Exclusive lock held while a port pair is allocated.
+.SH PORT ALLOCATION
+Instances use the 7010\-7999 range, two ports each: an app port
+.RB ( BIND )
+and a metrics port
+.RB ( METRICS_BIND ),
+allocated in stride\-two pairs (7010/7011, 7012/7013, ...). A port is free
+only if it is absent from listening sockets, from the
+.B BIND
+lines of every env file, and from the
+.B PROXYPORT
+of every proxy vhost. Allocation runs under an exclusive
+.BR flock (2)
+on the lock file above, held from the first read until the env file records
+the pair.
+.SH ROLLBACK
+.B enable
+and
+.B disable
+either complete or restore the host. Each step registers its undo, and a
+failure runs the undos in reverse order. The report names each artifact
+that went back. An undo that itself fails becomes a warning naming what
+needs manual cleanup and does not stop the remaining undos.
+.SH EXAMPLES
+Enable a single domain:
+.PP
+.RS 4
+nine-manage-anubis enable example.com
+.RE
+.PP
+Preview a batch, then run it zero\-downtime:
+.PP
+.RS 4
+nine-manage-anubis \-\-dry\-run enable \-\-all \-\-user www\-example
+.br
+nine-manage-anubis enable \-\-all \-\-user www\-example \-\-prepare\-only \-\-no\-notify\-services
+.br
+\fI# wait ~5 minutes for PHP\-FPM to pick up the .user.ini shim\fR
+.br
+nine-manage-anubis enable \-\-all \-\-user www\-example \-\-cutover\-only \-\-no\-notify\-services \-\-skip "vorlage*"
+.RE
+.PP
+Check a single domain's status, with a live probe:
+.PP
+.RS 4
+nine-manage-anubis status \-\-domain example.com \-\-health
+.RE
+.PP
+Monitor from a script:
+.PP
+.RS 4
+nine-manage-anubis \-\-json status \-\-health | jq '.[] | select(.state != "active") | .domain'
+.RE
+.SH SEE ALSO
+Full reference: \fIdocs/cli\-reference.md\fR in the source tree.
+Runbook: \fIdocs/runbook.md\fR.
+.PP
+Anubis: https://github.com/TecharoHQ/anubis
+.SH AUTHOR
+Third\-party tool. Not affiliated with or supported by nine.ch GmbH.
+.SH LICENSE
+MIT.
