@@ -390,7 +390,7 @@ When `enable` detects that a domain's webroot already has an Anubis instance, it
 
 - No new key, env file, origin vhost, or service instance is created.
 - The domain's public vhost is simply switched to the proxy template with the existing port.
-- A warning is issued: "`<domain> shares webroot with <primary> — fixups should already be installed`"
+- The shared webroot's fixups are re-checked and repaired if missing or drifted. The run that created the instance installs them, but it can be long gone — a migrated or restored webroot, a half-finished rollback, an operator cleanup — and without the shim every domain on the instance serves the wrong site.
 
 This handles WordPress multisite and other multi-domain setups where several domains share one webroot. See [Multisite detection](#multisite-detection).
 
@@ -860,7 +860,7 @@ Enable example.com:
 Warnings are printed to stderr:
 
 ```
-  WARNING: example.com shares webroot with other.com — fixups should already be installed
+  WARNING: anubis-prepend-chain.php includes legacy-prepend.php which no longer exists — chain may be stale
 ```
 
 Errors are printed to stderr:
@@ -879,7 +879,7 @@ Error: Enable failed: cutover failed. Rolled back 5 step(s).
     "Cut over example.com to proxy template (PROXYPORT=7010)"
   ],
   "warnings": [
-    "example.com shares webroot with other.com — fixups should already be installed"
+    "anubis-prepend-chain.php includes legacy-prepend.php which no longer exists — chain may be stale"
   ],
   "error": "Enable failed: cutover failed. Rolled back 5 step(s)."
 }
@@ -944,7 +944,7 @@ This handles:
 
 The detection works by scanning `nine-manage-vhosts virtual-host list --json` for vhosts with the same `webroot` value that are already using the `proxy_letsencrypt_https_redirect` template. The first match's `PROXYPORT` is reused.
 
-The origin fixup files (`.user.ini`, `anubis-origin-shim.php`, `.htaccess` block) are installed once in the shared webroot and apply to all vhosts — but they're **conditional on `X-Forwarded-Host`**, which is only set when proxying through Anubis. Vhosts serving directly (not behind Anubis) are unaffected.
+The origin fixup files (`.user.ini`, `anubis-origin-shim.php`, `.htaccess` block) are installed once in the shared webroot and apply to all vhosts — but they're **conditional on `X-Forwarded-Host`**, which is only set when proxying through Anubis. Vhosts serving directly (not behind Anubis) are unaffected. On every reuse `enable` re-checks them and repairs any that have gone missing or drifted, so a webroot whose fixups were lost (migration, rollback, manual cleanup) heals on the next enable.
 
 ---
 
@@ -969,7 +969,7 @@ The error message reports how many steps were rolled back:
 Error: Enable failed: cutover failed. Rolled back 5 step(s).
 ```
 
-For the **reuse path** (multisite), the only step that can fail is the cutover itself — rollback simply switches the vhost back to the default template.
+For the **reuse path** (multisite), the only step that can fail is the cutover itself — rollback simply switches the vhost back to the default template. Fixups repaired during reuse are **not** undone: they are shared infrastructure the whole instance depends on, and removing them on one domain's failure would break its siblings.
 
 ---
 

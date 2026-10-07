@@ -603,16 +603,27 @@ def cmd_enable(
                 f"Reusing existing Anubis instance for {alloc.reused_from} "
                 f"(port {alloc.app_port})"
             )
+            if not cutover_only:
+                # The run that created the instance installs the fixups, but it
+                # may be long gone: a webroot can be replaced (a migration, a
+                # Duplicator restore), a rollback can leave it half-restored, an
+                # operator can clean it up. Assume nothing — re-check and
+                # repair. Without the shim's X-Forwarded-Host restore the origin
+                # vhost is reached under its private name and the application
+                # serves the wrong site (or none) for *every* domain on the
+                # instance, not just this one.
+                ops = RemoteFileOps(website_user, runner)
+                fixup_plan = apply_fixups(webroot, ops, dry_run=dry_run)
+                if fixup_plan.steps:
+                    result.steps.extend(f"Fixup: {s}" for s in fixup_plan.steps)
+                    result.warnings.extend(fixup_plan.warnings)
+                else:
+                    result.steps.append("Fixups already installed")
+
             if dry_run:
                 if not prepare_only:
                     result.steps.append(f"Would switch {domain} to proxy template (PROXYPORT={alloc.app_port})")
                 return result
-
-            if not cutover_only:
-                result.warnings.append(
-                    f"{domain} shares webroot with {alloc.reused_from} — "
-                    f"fixups should already be installed"
-                )
 
             if not prepare_only:
                 try:

@@ -719,6 +719,36 @@ def test_enable_reuse_creates_certificate_if_missing():
     assert "blog.example.ch" in cert_commands[0]
 
 
+def test_enable_reuse_repairs_missing_fixups():
+    """A reused webroot whose fixups have gone is repaired, not assumed.
+
+    The instance can outlive the fixups — a migrated webroot, a half-finished
+    rollback, an operator cleanup — and without the shim every domain on the
+    instance serves the wrong site. `enable` re-checks and reinstalls them.
+    """
+    vhosts = """[
+      {"domain": "example.ch", "user": "www-example", "webroot": "/home/www-example/example.ch", "template": "proxy_letsencrypt_https_redirect", "template_variables": {"PROXYPORT": "7014"}, "aliases": [], "jobs": []},
+      {"domain": "blog.example.ch", "user": "www-example", "webroot": "/home/www-example/example.ch", "template": "default_letsencrypt_https", "template_variables": {"PHP_VERSION": "8.2"}, "aliases": [], "jobs": []}
+    ]"""
+    r = _base_runner(**{
+        "sudo nine-manage-vhosts virtual-host list --json": vhosts,
+        "ss -tlnp": "LISTEN 0 4096 0.0.0.0:7014 0.0.0.0:* users:((\"anubis\",pid=1,fd=3))\n",
+        _SU + "ls ~/.config/anubis/*.env 2>/dev/null": "/home/www-anubis/.config/anubis/example.ch.env\n",
+        _SU + "cat -- /home/www-anubis/.config/anubis/example.ch.env": "BIND=:7014\nMETRICS_BIND=:7015\nTARGET_HOST=origin-example.ch\n",
+        _SU + "cat -- /home/www-example/example.ch/": "__NINE_SU_FILE_NOT_FOUND__",
+        _SU + "test -f": "no\n",
+    })
+
+    result = cmd_enable("blog.example.ch", runner=r)
+    assert result.success
+    assert any("write anubis-origin-shim.php" in s for s in result.steps)
+    assert any(
+        "cat > /home/www-example/example.ch/anubis-origin-shim.php" in c
+        for c in r.calls
+    )
+    assert not any("fixups should already be installed" in w for w in result.warnings)
+
+
 # --- Input validation at the command entry points -----------------------------
 #
 # The library must be safe when driven directly, not just through the CLI.
