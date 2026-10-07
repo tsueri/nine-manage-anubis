@@ -91,6 +91,21 @@ ANUBIS_VERSION = Settings.anubis_version
 # failure then reads as a timeout rather than as curl exit code 28.
 PROBE_TIMEOUT = 10.0
 
+# The client the health probe claims to be. Anubis will not serve a request
+# that has no client address, and where it looks for one depends on how it was
+# built and run: stock Anubis takes X-Real-Ip when the caller set it, while a
+# build that always derives X-Real-Ip from X-Forwarded-For (a patched build, or
+# stock run with --custom-real-ip-header=X-Forwarded-For) throws away the
+# X-Real-Ip it was sent. Every Anubis also discards private, loopback,
+# link-local and CGNAT addresses from X-Forwarded-For, so a probe that says it
+# is 127.0.0.1 leaves such a build with no client at all, and a healthy
+# instance answers 500 ("X-Real-Ip header is not set").
+#
+# So the probe names one address in both headers, and it is one Anubis keeps:
+# a routable address that nobody owns — RFC 5737 documentation space, so it
+# cannot land in a real host's logs or match a real host's policy.
+PROBE_CLIENT_IP = "203.0.113.7"
+
 # The health check that follows a restart cannot judge the instance the moment
 # the restart returns: a Type=simple unit has systemctl come back as soon as
 # the process spawns, while the port its env file asks for opens a beat later.
@@ -135,12 +150,15 @@ def _http_probe(domain: str, port: int, runner: Runner) -> str:
 
     Every health check asks the same question, so the command is built in one
     place — including the quoting of the Host header, which carries a domain,
-    and of the URL, which carries a port. The `X-Real-Ip` header keeps Anubis
-    from challenging its own health check.
+    and of the URL, which carries a port. The probe presents itself as
+    ``PROBE_CLIENT_IP`` in both ``X-Real-Ip`` and ``X-Forwarded-For``, so that
+    Anubis finds a client address wherever it is built to look for one.
     """
     response = runner(
         f"curl -s -o /dev/null -w {quote('%{http_code}')} "
-        f"-H {quote('X-Real-Ip: 127.0.0.1')} -H {quote(f'Host: {domain}')} "
+        f"-H {quote(f'X-Real-Ip: {PROBE_CLIENT_IP}')} "
+        f"-H {quote(f'X-Forwarded-For: {PROBE_CLIENT_IP}')} "
+        f"-H {quote(f'Host: {domain}')} "
         f"{quote(f'http://localhost:{port}/')}",
         timeout=PROBE_TIMEOUT,
         what=f"probing {domain} on port {port}",

@@ -541,8 +541,10 @@ nine-manage-anubis upgrade [--version VERSION] [--no-rolling]
 After each restart, the CLI:
 
 1. Checks `systemctl --user is-active anubis@<domain>.service` is `active`.
-2. Sends an HTTP probe: `curl -H 'X-Real-Ip: 127.0.0.1' -H 'Host: <domain>' http://localhost:<port>/`
+2. Sends an HTTP probe: `curl -H 'X-Real-Ip: 203.0.113.7' -H 'X-Forwarded-For: 203.0.113.7' -H 'Host: <domain>' http://localhost:<port>/`
 3. Expects an HTTP 2xx or 3xx status code.
+
+The probe presents itself as `203.0.113.7` — an [RFC 5737](https://www.rfc-editor.org/rfc/rfc5737) documentation address that belongs to no one — in both `X-Real-Ip` and `X-Forwarded-For`. Anubis will not serve a request without a client address, and where it finds one depends on how it was built and run: stock Anubis reads `X-Real-Ip`, while a build that always derives `X-Real-Ip` from `X-Forwarded-For` (or stock run with `--custom-real-ip-header=X-Forwarded-For`) discards the `X-Real-Ip` it was sent. Every Anubis also drops private and loopback addresses from `X-Forwarded-For`, so a probe that claimed to be `127.0.0.1` would leave such a build with no client at all and read a healthy instance as `HTTP 500`. The address therefore has to be a routable one, and both headers carry it.
 
 If the service is not active or the HTTP probe fails, the upgrade stops immediately. Instances already restarted are on the new binary; unrestarted ones are still on the old binary (the old binary is gone from disk, but the running process keeps it in memory).
 

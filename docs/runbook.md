@@ -369,8 +369,9 @@ The recipe above assumes a greenfield vhost. In practice you're more likely to s
 
 10. **Verify Anubis is reachable directly** (before flipping the public vhost):
     ```sh
-    curl -sH "X-Real-Ip: 127.0.0.1" -H "Host: <domain>" http://localhost:7010/ | head -5
+    curl -sH "X-Real-Ip: 203.0.113.7" -H "X-Forwarded-For: 203.0.113.7" -H "Host: <domain>" http://localhost:7010/ | head -5
     ```
+    Both headers are needed — see [Troubleshooting](#troubleshooting) if this answers 500.
 
 11. **Cut over the public vhost to proxy mode** — this is the only step that causes a brief interruption (Apache reload). If the vhost already has an LE cert, it's a single command:
     ```sh
@@ -672,7 +673,7 @@ The Anubis binary, systemd template, and Anubis user remain — they're shared a
 
 ## Troubleshooting
 
-- **`curl localhost:7010` returns 500** — expected. Anubis requires the `X-Real-Ip` header, and nothing sets it on a bare localhost curl: the public vhost's `proxy_letsencrypt_https_redirect` template does **not** send `X-Real-Ip` (it only sets `X-Forwarded-Proto`; mod_proxy's default `X-Forwarded-For` append carries the client IP instead). Anubis itself derives `X-Real-Ip` from the rightmost XFF entry — unconditionally in v1.27.0 (`XForwardedForToXRealIP` middleware) — and with no XFF entries there is nothing to derive it from. Test through the public vhost instead: `curl https://<domain>/`.
+- **`curl localhost:7010` returns 500** — expected without a client address. Anubis will not serve a request that has none: it answers `[misconfiguration] X-Real-Ip header is not set` (the error page only carries that as an encoded blob; the instance's journal logs it plainly as `check failed`). The public vhost's `proxy_letsencrypt_https_redirect` template does **not** send `X-Real-Ip` (it only sets `X-Forwarded-Proto`; mod_proxy's default `X-Forwarded-For` append carries the client IP instead), so Anubis fills `X-Real-Ip` in from the rightmost `X-Forwarded-For` entry that is not private, loopback, link-local or CGNAT. Stock v1.27.0 does that only when `X-Real-Ip` is *unset*; a build that always derives it (a patched build, or stock run with `--custom-real-ip-header=X-Forwarded-For`) also discards an `X-Real-Ip` the caller sent. A bare localhost curl therefore has no client on either, and `-H 'X-Real-Ip: 127.0.0.1'` alone works only on stock — loopback is dropped from `X-Forwarded-For`, which leaves the always-derive builds with nothing. Send both headers with a routable address, as the health probe does: `curl -H 'X-Real-Ip: 203.0.113.7' -H 'X-Forwarded-For: 203.0.113.7' -H 'Host: <domain>' http://localhost:<port>/`. Or test through the public vhost: `curl https://<domain>/`.
 - **WARN logs about Thoth/geoip at startup** — expected. The embedded policy has geoip/ASN rules that no-op without a Thoth client. Harmless.
 - **Trailing-slash redirects point to `origin-<domain>`** — the `.htaccess` fixup isn't loaded. Check that `mod_rewrite` is enabled and the `.htaccess` is in the webroot.
 - **PHP sees `HTTP_HOST=origin-<domain>`** — the shim isn't loaded. Check that `.user.ini` points at `anubis-origin-shim.php` with the correct absolute path, and that PHP-FPM reads `.user.ini` (it does by default). **Note:** PHP-FPM caches `.user.ini` for 300 seconds (`user_ini.cache_ttl`) — if you just created or modified `.user.ini`, the shim won't take effect until the cache expires. Wait 5 minutes, or contact nine support to reload PHP-FPM if you need it immediately.

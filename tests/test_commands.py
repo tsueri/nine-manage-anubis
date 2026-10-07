@@ -1,5 +1,6 @@
 """Tests for commands.py — command implementations."""
 
+import ipaddress
 import json
 import posixpath
 import re
@@ -24,6 +25,7 @@ from nine_manage_anubis.commands import (
     cmd_selftest,
     ANUBIS_VERSION,
     DEFAULT_ANUBIS_USER,
+    PROBE_CLIENT_IP,
     PROBE_FAILED,
     PROBE_TIMEOUT,
     STARTUP_ATTEMPTS,
@@ -891,7 +893,58 @@ def test_http_probe_asks_for_the_status_code_only():
     words = argv(r.calls[0])
     assert words[:2] == ["curl", "-s"]
     assert "%{http_code}" in words
-    assert "X-Real-Ip: 127.0.0.1" in words
+
+
+# Anubis will not serve a request that has no client address, and it takes the
+# address from X-Real-Ip or from X-Forwarded-For depending on how it was built
+# and run. A build that always derives X-Real-Ip from X-Forwarded-For throws
+# away the X-Real-Ip the caller sent, and every Anubis strips private and
+# loopback addresses out of X-Forwarded-For — so a loopback probe carrying only
+# an X-Real-Ip finds a healthy instance answering 500 ("X-Real-Ip header is not
+# set"). The probe names the same address in both headers, and that address has
+# to be one Anubis keeps.
+
+
+def test_http_probe_names_the_same_client_in_both_ip_headers():
+    r = FakeRunner()
+    _http_probe("example.com", 7010, r)
+    words = argv(r.calls[0])
+    assert f"X-Real-Ip: {PROBE_CLIENT_IP}" in words
+    assert f"X-Forwarded-For: {PROBE_CLIENT_IP}" in words
+
+
+# The ranges Anubis discards from X-Forwarded-For before it will call an address
+# a client: private, loopback, link-local unicast and CGNAT (computeXFFHeader in
+# Anubis's internal/headers.go). Spelled out rather than asked of `ipaddress`,
+# whose is_private is also true for the documentation ranges the probe uses.
+_DISCARDED_BY_ANUBIS = [
+    ipaddress.ip_network(net)
+    for net in (
+        "10.0.0.0/8",
+        "172.16.0.0/12",
+        "192.168.0.0/16",
+        "127.0.0.0/8",
+        "169.254.0.0/16",
+        "100.64.0.0/10",
+    )
+]
+
+
+def test_the_probe_claims_an_address_anubis_does_not_discard():
+    client = ipaddress.ip_address(PROBE_CLIENT_IP)
+    assert client.version == 4
+    assert not client.is_multicast and not client.is_unspecified
+    assert not [net for net in _DISCARDED_BY_ANUBIS if client in net]
+
+
+def test_the_probe_claims_a_documentation_address_nobody_owns():
+    """Never an address that belongs to a real host, whose logs it would land in."""
+    client = ipaddress.ip_address(PROBE_CLIENT_IP)
+    documentation = [
+        ipaddress.ip_network(net)
+        for net in ("192.0.2.0/24", "198.51.100.0/24", "203.0.113.0/24")
+    ]
+    assert any(client in net for net in documentation)
 
 
 def test_every_health_check_uses_the_same_probe():
